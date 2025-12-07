@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 pyo3 = "0.25.0"
 rand = "0.9"
 rand_distr = "0.5"
+
+[dev-dependencies]
+rand_chacha = "0.9"
