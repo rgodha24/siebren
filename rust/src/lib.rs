@@ -1,6 +1,8 @@
 use pyo3::prelude::*;
 use std::hash::Hash;
 
+pub mod mcts;
+
 /// Formats the sum of two numbers as string.
 #[pyfunction]
 fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
@@ -14,54 +16,70 @@ fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Player {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Player {
     PlayerA,
     PlayerB,
 }
-#[derive(Clone, Copy, PartialEq)]
-enum TerminalState {
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TerminalState {
     Win(Player),
     Draw,
 }
 
-/// an environment implements a game, like Connect4, that we want to train a model to play.
+/// An action that can be taken in an environment.
 ///
-/// these environments should be able to rollback state updates to step in and out of states
-/// efficiently, with low copying costs.
-trait Environment: Clone + Hash {
-    /// sent to the neural network evaluator
-    type Observation;
-    /// this should be a cheap type, like an enum/usize. It should impl AsRef<usize>,
-    /// where the usize should be unique and in the range 0<=n<=NUM_ACTIONS;
-    type Action: Copy + Eq + Hash + AsRef<usize>;
-    /// used to rollback a move
-    type RollbackState;
+/// Actions must be convertible to/from a unique index in the range `0..NUM_ACTIONS`.
+/// This is used for indexing into policy vectors from the neural network.
+pub trait Action: Copy + Eq + Hash {
+    /// Total number of possible actions (for policy vector sizing)
     const NUM_ACTIONS: usize;
 
-    /// creates an environment. this should be ~randomly generated if possible on every call, to
-    /// avoid the network overfitting on a single map.
+    /// Convert this action to its unique index in `0..NUM_ACTIONS`
+    fn to_index(self) -> usize;
+
+    /// Convert an index back to an action. Returns None if index >= NUM_ACTIONS.
+    fn from_index(index: usize) -> Option<Self>;
+}
+
+/// An environment implements a game, like Connect4, that we want to train a model to play.
+///
+/// These environments should be able to rollback state updates to step in and out of states
+/// efficiently, with low copying costs.
+pub trait Environment: Clone + Hash {
+    /// Sent to the neural network evaluator
+    type Observation;
+    /// The action type for this environment
+    type Action: Action;
+    /// Used to rollback a move
+    type RollbackState;
+
+    /// Creates an environment. This should be randomly generated if possible on every call,
+    /// to avoid the network overfitting on a single map.
     fn new() -> Self;
-    /// returns None if the game is still going, and Some(PlayerAWin/PlayerBWin/Draw) if its over.
+
+    /// Returns None if the game is still going, and Some(Win/Draw) if it's over.
     fn is_terminal(&self) -> Option<TerminalState>;
 
-    /// returns an iterator over the valid actions. playing an
-    /// invalid action means the current player loses.
+    /// Returns an iterator over the valid actions. Playing an invalid action means
+    /// the current player loses.
     fn valid_actions(&self) -> impl Iterator<Item = Self::Action>;
-    /// current_player
+
+    /// Returns the current player
     fn current_player(&self) -> Player;
-    /// generates the observation that is fed to the neural network
+
+    /// Generates the observation that is fed to the neural network
     fn observation(&self) -> Self::Observation;
 
-    /// modifies the environment to accept this action. this returns a rollback state, which can be
-    /// passed to the rollback function, such that:
+    /// Modifies the environment to apply this action. Returns a rollback state which can be
+    /// passed to the rollback function such that:
     ///
-    /// E == rollback(apply_action(E, a))
+    /// `env == rollback(apply_action(env, a))`
     ///
-    /// implementors of this function may assume that the action is a valid action, as defined by
-    /// the valid_actions function.
+    /// Implementors may assume that the action is valid as defined by `valid_actions`.
     fn apply_action(&mut self, action: Self::Action) -> Self::RollbackState;
 
-    /// rollback function (look at docs for apply_action)
+    /// Rollback function (see docs for `apply_action`)
     fn rollback(&mut self, rollback: Self::RollbackState);
 }
