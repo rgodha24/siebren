@@ -128,8 +128,7 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
         }
 
         if !node.is_expanded() {
-            self.expand(env, node);
-            let (_, value) = self.evaluator.evaluate(env);
+            let value = self.expand(env, node);
             // value is from current_player's perspective, which equals node.player
             node.visit_count += 1;
             node.value_sum += value;
@@ -181,8 +180,8 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
             .expect("select_action called on node with no children")
     }
 
-    fn expand(&self, env: &mut E, node: &mut Node<E::Action>) {
-        let (policy, _) = self.evaluator.evaluate(env);
+    fn expand(&self, env: &mut E, node: &mut Node<E::Action>) -> f32 {
+        let (policy, value) = self.evaluator.evaluate(env);
         let valid: Vec<_> = env.valid_actions().collect();
 
         let mut priors: Vec<(E::Action, f32)> = valid
@@ -211,6 +210,8 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
                 (a, Node::new(prior, child_player))
             })
             .collect();
+
+        value
     }
 
     fn add_dirichlet_noise(&self, root: &mut Node<E::Action>, rng: &mut impl Rng) {
