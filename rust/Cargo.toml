@@ -9,6 +9,7 @@ name = "siebren"
 crate-type = ["cdylib"]
 
 [dependencies]
+ndarray = "0.17.1"
 pyo3 = "0.25.0"
 rand = "0.9"
 rand_distr = "0.5"

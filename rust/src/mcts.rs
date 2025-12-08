@@ -1,7 +1,7 @@
 use rand::Rng;
 use rand_distr::{Distribution, Gamma};
 
-use crate::{Action, Environment, TerminalState};
+use crate::{Action, Environment, Player, TerminalState};
 
 pub trait Evaluator<E: Environment> {
     /// Returns (policy, value) where policy is over all actions and value is in [-1, 1]
@@ -29,6 +29,7 @@ impl Default for MCTSConfig {
 }
 
 struct Node<A> {
+    player: Player,
     visit_count: u32,
     value_sum: f32,
     prior: f32,
@@ -36,8 +37,9 @@ struct Node<A> {
 }
 
 impl<A> Node<A> {
-    fn new(prior: f32) -> Self {
+    fn new(prior: f32, player: Player) -> Self {
         Self {
+            player,
             visit_count: 0,
             value_sum: 0.0,
             prior,
@@ -76,7 +78,7 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
     }
 
     pub fn search(&self, env: &mut E, rng: &mut impl Rng) -> Vec<u32> {
-        let mut root = Node::new(0.0);
+        let mut root = Node::new(0.0, env.current_player());
 
         self.expand(env, &mut root);
         self.add_dirichlet_noise(&mut root, rng);
@@ -101,8 +103,8 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
         }
     }
 
-    /// Q values represent "how good is this action for the parent who chose it".
-    /// Returns value from perspective of the player who moved INTO this node.
+    /// Q values stored from the perspective of the node's player.
+    /// Returns value from perspective of the node's player.
     fn traverse_and_expand(
         &self,
         env: &mut E,
@@ -112,10 +114,10 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
         if let Some(term) = env.is_terminal() {
             let v = match term {
                 TerminalState::Win(winner) => {
-                    if winner == env.current_player() {
-                        -1.0
-                    } else {
+                    if winner == node.player {
                         1.0
+                    } else {
+                        -1.0
                     }
                 }
                 TerminalState::Draw => 0.0,
@@ -128,10 +130,10 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
         if !node.is_expanded() {
             self.expand(env, node);
             let (_, value) = self.evaluator.evaluate(env);
-            let v = -value;
+            // value is from current_player's perspective, which equals node.player
             node.visit_count += 1;
-            node.value_sum += v;
-            return v;
+            node.value_sum += value;
+            return value;
         }
 
         let action = self.select_action(node);
@@ -145,7 +147,13 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
             .unwrap();
 
         let child_value = self.traverse_and_expand(env, child, rollbacks);
-        let value = -child_value;
+
+        // Convert child's value to this node's perspective
+        let value = if child.player == node.player {
+            child_value
+        } else {
+            -child_value
+        };
         node.visit_count += 1;
         node.value_sum += value;
 
@@ -158,8 +166,14 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
         node.children
             .iter()
             .map(|(action, child)| {
-                let ucb = child.q()
-                    + self.config.c_puct * child.prior * sqrt_n / (1.0 + child.visit_count as f32);
+                // Q is from child's perspective; convert to parent's for comparison
+                let q = if child.player == node.player {
+                    child.q()
+                } else {
+                    -child.q()
+                };
+                let ucb = q + self.config.c_puct * child.prior * sqrt_n
+                    / (1.0 + child.visit_count as f32);
                 (action, ucb)
             })
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
@@ -167,7 +181,7 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
             .expect("select_action called on node with no children")
     }
 
-    fn expand(&self, env: &E, node: &mut Node<E::Action>) {
+    fn expand(&self, env: &mut E, node: &mut Node<E::Action>) {
         let (policy, _) = self.evaluator.evaluate(env);
         let valid: Vec<_> = env.valid_actions().collect();
 
@@ -190,7 +204,12 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
 
         node.children = priors
             .into_iter()
-            .map(|(a, prior)| (a, Node::new(prior)))
+            .map(|(a, prior)| {
+                let rollback = env.apply_action(a);
+                let child_player = env.current_player();
+                env.rollback(rollback);
+                (a, Node::new(prior, child_player))
+            })
             .collect();
     }
 
@@ -290,9 +309,7 @@ mod tests {
 
     impl Evaluator<TicTacToe> for SmartEvaluator {
         fn evaluate(&self, _env: &TicTacToe) -> (Vec<f32>, f32) {
-            let policy = vec![
-                0.12, 0.05, 0.12, 0.05, 0.20, 0.05, 0.12, 0.05, 0.12,
-            ];
+            let policy = vec![0.12, 0.05, 0.12, 0.05, 0.20, 0.05, 0.12, 0.05, 0.12];
             (policy, 0.0)
         }
     }

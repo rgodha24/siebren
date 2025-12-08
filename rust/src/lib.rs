@@ -15,10 +15,11 @@ fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+#[repr(i8)]
 pub enum Player {
-    PlayerA,
-    PlayerB,
+    PlayerA = 1,
+    PlayerB = -1,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
