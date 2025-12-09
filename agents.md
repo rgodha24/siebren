@@ -8,8 +8,15 @@ Training infrastructure for AlphaZero-style game engines.
 rust/src/
 ├── lib.rs              # Core traits (Action, Environment, Player, TerminalState)
 ├── mcts.rs             # MCTS implementation
+├── evaluator.rs        # ONNX Runtime neural network evaluator
+├── replay_buffer.rs    # Experience replay buffer (PyO3 bindings)
 └── environments/
-    └── tictactoe.rs    # Example environment
+    ├── tictactoe.rs    # TicTacToe environment
+    └── connect4.rs     # Connect4 environment
+
+src/siebren/
+├── __init__.py         # Python package (re-exports Rust bindings)
+└── export.py           # ONNX model export with type introspection
 ```
 
 ## Core Concepts
@@ -50,8 +57,33 @@ Q values in MCTS nodes represent "how good was this action for the player who ch
 
 Network returns value from `current_player`'s perspective; MCTS negates appropriately during backprop.
 
-## Running Tests
+## Development Setup
+
+Requires Nix for reproducible builds with CUDA and OpenSSL:
 
 ```bash
-cd rust && cargo test
+nix develop
+```
+
+## Building
+
+```bash
+nix develop -c sh -c "uv run maturin develop --release"
+```
+
+## Running Tests
+
+Rust tests (MCTS, environments, evaluator):
+```bash
+nix develop -c sh -c "cargo test --manifest-path rust/Cargo.toml"
+```
+
+Python tests (ReplayBuffer, ONNX export):
+```bash
+nix develop -c sh -c "uv run pytest"
+```
+
+All tests:
+```bash
+nix develop -c sh -c "cargo test --manifest-path rust/Cargo.toml && uv run pytest"
 ```

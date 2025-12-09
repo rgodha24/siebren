@@ -71,6 +71,12 @@
           export PATH=$CUDA_PATH/bin:$PATH
           export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
           export NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+
+          # For ort crate to find OpenSSL
+          export OPENSSL_DIR=${pkgs.openssl.dev}
+          export OPENSSL_LIB_DIR=${pkgs.openssl.out}/lib
+          export OPENSSL_INCLUDE_DIR=${pkgs.openssl.dev}/include
+          export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig:$PKG_CONFIG_PATH
         '';
       };
     });
