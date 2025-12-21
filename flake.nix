@@ -39,8 +39,6 @@
           cudaPkgs.libcusparse
           cudaPkgs.libcusolver
           cudaPkgs.nccl
-          cudaPkgs.tensorrt
-          cudaPkgs.tensorrt.lib
 
           libGL
           libGLU
@@ -64,24 +62,15 @@
           export CUDA_HOME=$CUDA_PATH
           export CUDA_ROOT=$CUDA_PATH
 
-          # TensorRT paths
-          export TENSORRT_PATH=${cudaPkgs.tensorrt.lib}
-
           if [ -d "/run/opengl-driver/lib" ]; then
-            export LD_LIBRARY_PATH=$CUDA_PATH/lib:$CUDA_PATH/lib64:$TENSORRT_PATH/lib:/run/opengl-driver/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
+            export LD_LIBRARY_PATH=$CUDA_PATH/lib64:/run/opengl-driver/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
           else
-            export LD_LIBRARY_PATH=$CUDA_PATH/lib:$CUDA_PATH/lib64:$TENSORRT_PATH/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
+            export LD_LIBRARY_PATH=$CUDA_PATH/lib64:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
           fi
 
           export PATH=$CUDA_PATH/bin:$PATH
           export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
           export NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
-
-          # For ort crate to find OpenSSL
-          export OPENSSL_DIR=${pkgs.openssl.dev}
-          export OPENSSL_LIB_DIR=${pkgs.openssl.out}/lib
-          export OPENSSL_INCLUDE_DIR=${pkgs.openssl.dev}/include
-          export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig:$PKG_CONFIG_PATH
         '';
       };
     });

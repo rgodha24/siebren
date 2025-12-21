@@ -13,7 +13,6 @@ ndarray = "0.17.1"
 pyo3 = "0.25.0"
 rand = "0.9"
 rand_distr = "0.5"
-ort = { version = "2.0.0-rc.10", features = ["cuda", "tensorrt", "copy-dylibs", "download-binaries", "ndarray"] }
 
 [dev-dependencies]
 rand_chacha = "0.9"
