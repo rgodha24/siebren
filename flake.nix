@@ -39,6 +39,8 @@
           cudaPkgs.libcusparse
           cudaPkgs.libcusolver
           cudaPkgs.nccl
+          cudaPkgs.tensorrt
+          cudaPkgs.tensorrt.lib
 
           libGL
           libGLU
@@ -62,10 +64,13 @@
           export CUDA_HOME=$CUDA_PATH
           export CUDA_ROOT=$CUDA_PATH
 
+          # TensorRT paths
+          export TENSORRT_PATH=${cudaPkgs.tensorrt.lib}
+
           if [ -d "/run/opengl-driver/lib" ]; then
-            export LD_LIBRARY_PATH=$CUDA_PATH/lib64:/run/opengl-driver/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
+            export LD_LIBRARY_PATH=$CUDA_PATH/lib:$CUDA_PATH/lib64:$TENSORRT_PATH/lib:/run/opengl-driver/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
           else
-            export LD_LIBRARY_PATH=$CUDA_PATH/lib64:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
+            export LD_LIBRARY_PATH=$CUDA_PATH/lib:$CUDA_PATH/lib64:$TENSORRT_PATH/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
           fi
 
           export PATH=$CUDA_PATH/bin:$PATH
