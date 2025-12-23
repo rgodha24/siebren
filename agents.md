@@ -1,57 +1,32 @@
-# Siebren
+# AGENTS.md
 
-Training infrastructure for AlphaZero-style game engines.
+AlphaZero-style game engine training infrastructure. Rust core with Python bindings via PyO3/maturin.
+
+## Build & Test Commands
+
+- **Rust tests**: `cd rust && cargo test` (single test: `cargo test test_name`)
+- **Python build**: `maturin develop` (builds Rust extension for Python)
+- **Python tests**: `pytest src/tests/` (single test: `pytest src/tests/test_all.py::test_name`)
+
+## Code Style
+
+- **Rust**: Edition 2021, use `cargo fmt` and `cargo clippy`
+- **Python**: Follow PEP 8, use type hints
+- **Naming**: snake_case for functions/variables, PascalCase for types/traits
+- **Imports**: Group std lib, external crates, then local modules
 
 ## Architecture
 
-```
-rust/src/
-├── lib.rs              # Core traits (Action, Environment, Player, TerminalState)
-├── mcts.rs             # MCTS implementation
-└── environments/
-    └── tictactoe.rs    # Example environment
-```
+- Core traits in `rust/src/lib.rs`: `Action`, `Environment`, `Player`, `TerminalState`
+- MCTS implementation in `rust/src/mcts.rs` with `Evaluator` trait for neural network interface
+- Environments in `rust/src/environments/` (implement `Environment` trait)
 
-## Core Concepts
+## Key Patterns
 
-### Action
-Represents a move in a game. Must map to/from indices in `0..NUM_ACTIONS` for neural network policy vectors.
+- Environments use apply/rollback for efficient tree search without cloning
+- Q values represent "how good was this action for the player who chose it"
+- Network returns value from current player's perspective; MCTS negates during backprop
 
-### Environment
-A game state that supports:
-- Checking terminal conditions (win/draw)
-- Listing valid actions
-- Apply/rollback for efficient tree search without cloning
+## other stuff
 
-### Evaluator
-Neural network interface. Takes an environment, returns `(policy, value)` where:
-- `policy`: probability distribution over actions
-- `value`: position evaluation in [-1, 1] from current player's perspective
-
-### MCTS
-Monte Carlo Tree Search with:
-- UCB action selection with configurable `c_puct`
-- Dirichlet noise at root for exploration
-- Efficient rollback-based tree traversal
-
-## Adding a New Environment
-
-1. Create `rust/src/environments/yourgame.rs`
-2. Define action type implementing `Action`
-3. Define game state implementing `Environment`
-4. Add `pub mod yourgame;` to `environments/mod.rs`
-
-## Value Semantics
-
-Q values in MCTS nodes represent "how good was this action for the player who chose it". Terminal values:
-- Win for player who just moved: +1
-- Loss for player who just moved: -1
-- Draw: 0
-
-Network returns value from `current_player`'s perspective; MCTS negates appropriately during backprop.
-
-## Running Tests
-
-```bash
-cd rust && cargo test
-```
+ALWAYS PREPEND COMMANDS WITH `nix develop -c` and IF IT IS PYTHON THEN `nix develop -c uv run ...`

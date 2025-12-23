@@ -12,7 +12,7 @@ GAMES_PER_STEP = 4096
 TRAIN_STEPS = 10
 
 
-class ReplayBuffer:
+class Resevoir:
     def sample(
         self, amt: int
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]: ...
@@ -26,14 +26,12 @@ def SelfPlay_snake(envs: int) -> "SelfPlay":
 
 class SelfPlay:
     envs: int
-    replay_buffer: ReplayBuffer
+    replay_buffer: Resevoir
 
     def __init__(self, envs: int) -> None:
         self.envs = envs
 
-    def play_games(
-        self, replay_buffer: ReplayBuffer, num_games: int, model_name: str
-    ): ...
+    def play_games(self, replay_buffer: Resevoir, num_games: int, model_name: str): ...
 
 
 class SnakeModel(nn.Module):
@@ -81,7 +79,7 @@ def save_model(model: nn.Module, epoch: int) -> str: ...
 
 
 model = SnakeModel().to(device="cuda", dtype=torch.bfloat16)
-replay_buffer = ReplayBuffer()
+replay_buffer = Resevoir()
 self_play = SelfPlay_snake(ENVS)
 optimizer = torch.optim.Muon(model.parameters())
 
@@ -108,4 +106,3 @@ for epoch in range(EPOCHS):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
