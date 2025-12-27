@@ -184,7 +184,7 @@ class ModelConfig:
     actions: int = 11
 
 
-class PerceiverLatent0Heur(nn.Module):
+class Perceiver(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
@@ -231,7 +231,7 @@ class PerceiverLatent0Heur(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(cfg.embed_dim, cfg.embed_dim, bias=False),
             nn.SiLU(),
-            nn.Linear(cfg.embed_dim, 3, bias=True),
+            nn.Linear(cfg.embed_dim, 2, bias=True),
         )
 
     def forward(
@@ -425,7 +425,7 @@ def main():
                     pool_type=args.pool_type,
                 )
 
-                model = PerceiverLatent0Heur(cfg).to(device=device, dtype=dtype).eval()
+                model = Perceiver(cfg).to(device=device, dtype=dtype).eval()
 
                 n_params = sum(p.numel() for p in model.parameters())
                 print(f"Model params: {n_params:,}")
