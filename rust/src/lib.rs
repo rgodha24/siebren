@@ -2,7 +2,14 @@ use pyo3::prelude::*;
 use std::hash::Hash;
 
 pub mod environments;
+pub mod eval;
+pub mod executor;
+pub mod future;
+mod integration_tests;
 pub mod mcts;
+pub mod queue;
+pub mod training;
+pub mod worker;
 
 #[pyfunction]
 fn sum_as_string(a: usize, b: usize) -> PyResult<String> {

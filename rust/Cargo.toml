@@ -12,7 +12,8 @@ crate-type = ["cdylib"]
 ndarray = "0.17.1"
 pyo3 = "0.25.0"
 rand = "0.9"
+rand_chacha = "0.9"
 rand_distr = "0.5"
+event-listener = "5"
 
 [dev-dependencies]
-rand_chacha = "0.9"
