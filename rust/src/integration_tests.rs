@@ -178,7 +178,7 @@ mod tests {
 
     /// Test worker_loop runs until a global target of games is reached.
     #[test]
-    fn test_worker_loop_with_games_per_worker() {
+    fn test_worker_loop_with_shared_counter() {
         let evaluator = SyncEvaluator::new(|_env: &TicTacToe| {
             let mut policy = vec![0.0; 9];
             policy[0] = 1.0;
@@ -195,10 +195,9 @@ mod tests {
 
         let num_workers = 8;
         let target_games = 32;
-        let total_games = Arc::new(AtomicUsize::new(0));
+        let games_completed = Arc::new(AtomicUsize::new(0));
 
         let samples_collected = Rc::new(RefCell::new(0usize));
-        let games_completed = Rc::new(RefCell::new(0usize));
 
         let futures: Vec<_> = (0..num_workers)
             .map(|i| {
@@ -206,19 +205,17 @@ mod tests {
                 let config = config.clone();
                 let samples_collected = samples_collected.clone();
                 let games_completed = games_completed.clone();
-                let total_games = total_games.clone();
                 let mut rng = ChaCha8Rng::seed_from_u64(i as u64);
                 async move {
-                    loop {
-                        let idx = total_games.fetch_add(1, Ordering::AcqRel);
-                        if idx >= target_games {
-                            break;
-                        }
-                        let samples =
-                            worker_loop::<TicTacToe, _, _>(evaluator, &config, &mut rng, 1).await;
-                        *samples_collected.borrow_mut() += samples.len();
-                        *games_completed.borrow_mut() += 1;
-                    }
+                    let samples = worker_loop::<TicTacToe, _, _>(
+                        evaluator,
+                        &config,
+                        &mut rng,
+                        games_completed,
+                        target_games,
+                    )
+                    .await;
+                    *samples_collected.borrow_mut() += samples.len();
                 }
             })
             .collect();
@@ -231,13 +228,14 @@ mod tests {
             || false,
         );
 
-        let completed = *games_completed.borrow();
+        let completed = games_completed.load(Ordering::Relaxed);
         let samples = *samples_collected.borrow();
-        assert_eq!(completed, target_games);
+        // We complete at least target_games (may be slightly more due to race)
+        assert!(completed >= target_games);
         assert!(samples >= target_games * 5);
     }
 
-    /// Test multithreaded worker_loop with fixed games per worker using the sync evaluator.
+    /// Test multithreaded worker_loop with shared counter using the sync evaluator.
     #[test]
     fn test_multithreaded_worker_loop() {
         const NUM_THREADS: usize = 2;
@@ -245,11 +243,11 @@ mod tests {
         const TARGET_GAMES: usize = 32;
 
         let total_samples = Arc::new(AtomicUsize::new(0));
-        let total_games = Arc::new(AtomicUsize::new(0));
+        let games_completed = Arc::new(AtomicUsize::new(0));
 
         let handles: Vec<_> = (0..NUM_THREADS)
             .map(|thread_id| {
-                let total_games = total_games.clone();
+                let games_completed = games_completed.clone();
                 let total_samples = total_samples.clone();
 
                 thread::spawn(move || {
@@ -268,43 +266,26 @@ mod tests {
                     let executor = Executor::new(|| event_listener::Event::new().listen());
 
                     let samples_collected = Rc::new(RefCell::new(0usize));
-                    let games_collected = Rc::new(RefCell::new(0usize));
 
                     let futures: Vec<_> = (0..WORKERS_PER_THREAD)
                         .map(|i| {
                             let evaluator = &evaluator;
                             let config = config.clone();
                             let samples_collected = samples_collected.clone();
-                            let games_collected = games_collected.clone();
-                            let total_games = total_games.clone();
+                            let games_completed = games_completed.clone();
                             let total_samples = total_samples.clone();
                             let mut rng = ChaCha8Rng::seed_from_u64((thread_id * 1000 + i) as u64);
                             async move {
-                                loop {
-                                    let current = total_games.load(Ordering::Acquire);
-                                    if current >= TARGET_GAMES {
-                                        break;
-                                    }
-                                    if total_games
-                                        .compare_exchange(
-                                            current,
-                                            current + 1,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_err()
-                                    {
-                                        continue;
-                                    }
-
-                                    let samples = worker_loop::<TicTacToe, _, _>(
-                                        evaluator, &config, &mut rng, 1,
-                                    )
-                                    .await;
-                                    total_samples.fetch_add(samples.len(), Ordering::AcqRel);
-                                    *samples_collected.borrow_mut() += samples.len();
-                                    *games_collected.borrow_mut() += 1;
-                                }
+                                let samples = worker_loop::<TicTacToe, _, _>(
+                                    evaluator,
+                                    &config,
+                                    &mut rng,
+                                    games_completed,
+                                    TARGET_GAMES,
+                                )
+                                .await;
+                                total_samples.fetch_add(samples.len(), Ordering::AcqRel);
+                                *samples_collected.borrow_mut() += samples.len();
                             }
                         })
                         .collect();
@@ -320,10 +301,9 @@ mod tests {
                         || false,
                     );
 
-                    // Return (samples, games) collected by this thread
-                    let samples = *samples_collected.borrow();
-                    let games = *games_collected.borrow();
-                    (samples, games)
+                    // Return samples collected by this thread
+                    let count = *samples_collected.borrow();
+                    count
                 })
             })
             .collect();
@@ -333,10 +313,11 @@ mod tests {
             let _ = handle.join().expect("thread panicked");
         }
 
-        let completed = total_games.load(Ordering::Relaxed);
+        let completed = games_completed.load(Ordering::Relaxed);
         let samples = total_samples.load(Ordering::Relaxed);
 
-        assert_eq!(completed, TARGET_GAMES);
+        // We complete at least TARGET_GAMES (may be slightly more due to race)
+        assert!(completed >= TARGET_GAMES);
         assert!(samples >= TARGET_GAMES * 5);
     }
 }

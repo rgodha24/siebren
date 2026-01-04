@@ -11,7 +11,7 @@ impl Action for TicTacToeAction {
     }
 
     fn from_index(index: usize) -> Option<Self> {
-        (index < 9).then(|| TicTacToeAction(index as u8))
+        (index < 9).then_some(TicTacToeAction(index as u8))
     }
 }
 

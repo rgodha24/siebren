@@ -240,9 +240,7 @@ fn sample_dirichlet(n: usize, alpha: f32, rng: &mut impl Rng) -> Vec<f32> {
         }
     } else {
         let uniform = 1.0 / n as f32;
-        for s in &mut samples {
-            *s = uniform;
-        }
+        samples.fill(uniform);
     }
     samples
 }

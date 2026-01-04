@@ -3,6 +3,7 @@
 //! This module provides the entry point for running parallel self-play
 //! with GPU-batched inference.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -26,9 +27,8 @@ pub struct TrainingConfig {
     pub worker: WorkerConfig,
     /// Random seed for reproducibility.
     pub seed: u64,
-    /// Number of games each worker should play.
-    /// Total games = num_threads * workers_per_thread * games_per_worker.
-    pub games_per_worker: usize,
+    /// Total number of games to play across all workers.
+    pub total_games: usize,
 }
 
 impl Default for TrainingConfig {
@@ -38,7 +38,7 @@ impl Default for TrainingConfig {
             workers_per_thread: 16,
             worker: WorkerConfig::default(),
             seed: 42,
-            games_per_worker: 20,
+            total_games: 10240,
         }
     }
 }
@@ -59,9 +59,9 @@ pub struct TrainingResult<E: Environment> {
 /// The `dispatch` callback is called when a batch of observations is ready
 /// for GPU inference. It should fill the output policy/value pairs.
 ///
-/// Each worker plays exactly `games_per_worker` games. This ensures all workers
-/// stay alive together and prevents the deadlock where fewer than BATCH_SIZE
-/// workers remain active.
+/// Workers share an atomic counter for games completed. When the target is
+/// reached, remaining workers are cancelled via the executor. This allows
+/// fast workers to complete more games while slow workers are still playing.
 ///
 /// Note: Due to Rust's const generics limitations, `NUM_ACTIONS` must be specified
 /// as a const generic parameter rather than inferred from the Environment.
@@ -74,8 +74,10 @@ where
     E::Observation: Copy + Default + Send + Sync,
     F: Fn(&[E::Observation], &mut [PolicyValue<NUM_ACTIONS>]) + Send + Sync + 'static,
 {
-    let total_workers = config.num_threads * config.workers_per_thread;
-    let total_games = total_workers * config.games_per_worker;
+    let target_games = config.total_games;
+
+    // Shared counter for games completed across all workers
+    let games_completed = Arc::new(AtomicUsize::new(0));
 
     // Create shared GPU queue
     let queue: Arc<GpuJobQueue<E::Observation, PolicyValue<NUM_ACTIONS>>> =
@@ -87,8 +89,11 @@ where
     for thread_id in 0..config.num_threads {
         let queue = queue.clone();
         let config = config.clone();
+        let games_completed = games_completed.clone();
 
-        let handle = thread::spawn(move || run_thread::<E, NUM_ACTIONS>(thread_id, queue, config));
+        let handle = thread::spawn(move || {
+            run_thread::<E, NUM_ACTIONS>(thread_id, queue, config, games_completed, target_games)
+        });
 
         handles.push(handle);
     }
@@ -100,8 +105,9 @@ where
         all_samples.extend(thread_samples);
     }
 
+    let final_count = games_completed.load(Ordering::Acquire);
     TrainingResult {
-        games_completed: total_games,
+        games_completed: final_count,
         samples: all_samples,
     }
 }
@@ -112,6 +118,8 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
     thread_id: usize,
     queue: Arc<GpuJobQueue<E::Observation, PolicyValue<NUM_ACTIONS>>>,
     config: TrainingConfig,
+    games_completed: Arc<AtomicUsize>,
+    target_games: usize,
 ) -> Vec<TrainingSample<E>>
 where
     E: Environment + Clone + 'static,
@@ -126,9 +134,9 @@ where
     // Create evaluator that uses the shared queue
     let evaluator = Rc::new(GpuEvaluator::<E, NUM_ACTIONS>::new(&*queue));
     let worker_config = Rc::new(config.worker.clone());
-    let games_per_worker = config.games_per_worker;
 
-    // Create executor
+    // Create executor with cancel callback that checks if target is reached
+    let games_completed_for_cancel = games_completed.clone();
     let executor = Executor::new(|| queue.listen());
 
     // Collect samples from all workers
@@ -140,14 +148,16 @@ where
             let evaluator = evaluator.clone();
             let worker_config = worker_config.clone();
             let all_samples = all_samples.clone();
+            let games_completed = games_completed.clone();
             let mut rng = ChaCha8Rng::seed_from_u64(base_seed + i as u64);
 
             async move {
                 let samples = worker_loop::<E, _, _>(
                     &*evaluator,
-                    &*worker_config,
+                    &worker_config,
                     &mut rng,
-                    games_per_worker,
+                    games_completed,
+                    target_games,
                 )
                 .await;
                 all_samples.borrow_mut().extend(samples);
@@ -155,13 +165,21 @@ where
         })
         .collect();
 
-    // Run all workers until all games are complete
+    // Run all workers until target games reached
     executor.run(
         futures
             .into_iter()
             .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
             .collect(),
-        || false,
+        || {
+            // Cancel when we've reached the target
+            let done = games_completed_for_cancel.load(Ordering::Acquire) >= target_games;
+            if done {
+                // Wake any blocked workers so they can exit
+                queue.notify_all();
+            }
+            done
+        },
     );
 
     // Log completion

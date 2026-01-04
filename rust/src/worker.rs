@@ -2,6 +2,9 @@
 //!
 //! Each worker runs MCTS searches, plays games, and collects training samples.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use rand::Rng;
 
 use crate::eval::Evaluator;
@@ -77,10 +80,9 @@ where
         };
         let policy = visits_to_policy(&visits, temp);
 
-        // Get value estimate from search (use best child's Q-value as approximation)
-        // For simplicity, we store 0.0 here - the actual training might backfill
-        // with game outcome or use the search value differently
-        // TODO: FUCKING FIX THIS
+        // Value is set to 0.0 here and backfilled with game outcome after the game ends.
+        // This is standard AlphaZero practice - we use the actual game result rather than
+        // the search value estimate for training.
         let value = 0.0;
 
         // Record sample
@@ -132,19 +134,19 @@ fn backfill_values<E: Environment>(samples: &mut [TrainingSample<E>], outcome: T
     }
 }
 
-/// Run a worker loop that plays a fixed number of games.
+/// Run a worker loop that plays games until the target is reached.
 ///
-/// Each worker plays exactly `games_per_worker` games and then returns.
-/// This is simpler than the shared counter approach and avoids the deadlock
-/// issue where workers exit at different times leaving insufficient concurrent
-/// workers to fill batches.
+/// Workers play games and increment `games_completed` after each game.
+/// When the counter reaches `target_games`, workers stop. The executor's
+/// cancel callback should check this condition to terminate remaining workers.
 ///
 /// Returns the collected samples from this worker.
 pub async fn worker_loop<E, V, R>(
     evaluator: &V,
     config: &WorkerConfig,
     rng: &mut R,
-    games_per_worker: usize,
+    games_completed: Arc<AtomicUsize>,
+    target_games: usize,
 ) -> Vec<TrainingSample<E>>
 where
     E: Environment + Clone,
@@ -153,9 +155,23 @@ where
 {
     let mut samples = Vec::new();
 
-    for _ in 0..games_per_worker {
+    loop {
+        // Check if target already reached before starting a new game
+        if games_completed.load(Ordering::Acquire) >= target_games {
+            break;
+        }
+
+        // Play a game
         let game_samples = play_game::<E, V, R>(evaluator, config, rng).await;
         samples.extend(game_samples);
+
+        // Increment completed counter
+        let completed = games_completed.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // If we just hit the target, we're done
+        if completed >= target_games {
+            break;
+        }
     }
 
     samples

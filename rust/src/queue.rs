@@ -123,19 +123,15 @@ where
     fn dispatch_batch(&self, batch_idx: usize, trigger_ticket: u64) {
         let batch_start_slot = batch_idx * BATCH_SIZE;
 
-        // Collect inputs into a contiguous slice for the callback
         // SAFETY: All writes to this batch are complete (batch_writes == BATCH_SIZE)
         let inputs: Vec<I> = (batch_start_slot..batch_start_slot + BATCH_SIZE)
             .map(|i| unsafe { *self.inputs[i].get() })
             .collect();
 
-        // Prepare output buffer
         let mut outputs: Vec<O> = vec![O::default(); BATCH_SIZE];
 
-        // Call the dispatch callback
         (self.dispatch)(&inputs, &mut outputs);
 
-        // Write outputs back to slots
         // SAFETY: We're the only one writing outputs for this batch
         for (i, output) in outputs.into_iter().enumerate() {
             unsafe {
