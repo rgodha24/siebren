@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use std::hash::Hash;
+use std::{fmt::Debug, hash::Hash};
 
 pub mod environments;
 pub mod eval;
@@ -37,7 +37,6 @@ pub enum TerminalState {
 
 /// Actions must be convertible to/from a unique index in `0..NUM_ACTIONS`.
 pub trait Action: Copy + Eq + Hash {
-    const NUM_ACTIONS: usize;
     fn to_index(self) -> usize;
     fn from_index(index: usize) -> Option<Self>;
 }
@@ -46,11 +45,12 @@ pub trait Action: Copy + Eq + Hash {
 ///
 /// Environments should support efficient rollback to step in and out of states
 /// without cloning.
-pub trait Environment: Clone + Hash {
+pub trait Environment: Clone + Hash + Debug {
     /// Sent to the neural network evaluator.
     type Observation;
     type Action: Action;
     type RollbackState;
+    const NUM_ACTIONS: usize;
 
     /// Creates an environment. Should be randomly generated if possible to
     /// avoid the network overfitting on a single starting position.

@@ -4,8 +4,6 @@ use crate::{Action, Environment, Player, TerminalState};
 pub struct TicTacToeAction(pub u8);
 
 impl Action for TicTacToeAction {
-    const NUM_ACTIONS: usize = 9;
-
     fn to_index(self) -> usize {
         self.0 as usize
     }
@@ -15,7 +13,7 @@ impl Action for TicTacToeAction {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub struct TicTacToe {
     pub board: [u8; 9], // 0 = empty, 1 = PlayerA (X), 2 = PlayerB (O)
     current_player: Player,
@@ -60,6 +58,7 @@ impl Environment for TicTacToe {
     type Observation = [u8; 9];
     type Action = TicTacToeAction;
     type RollbackState = TicTacToeRollback;
+    const NUM_ACTIONS: usize = 9;
 
     fn new() -> Self {
         TicTacToe {
@@ -133,7 +132,7 @@ mod tests {
         assert_eq!(TicTacToeAction::from_index(0), Some(TicTacToeAction(0)));
         assert_eq!(TicTacToeAction::from_index(8), Some(TicTacToeAction(8)));
         assert_eq!(TicTacToeAction::from_index(9), None);
-        assert_eq!(TicTacToeAction::NUM_ACTIONS, 9);
+        assert_eq!(TicTacToe::NUM_ACTIONS, 9);
     }
 
     #[test]

@@ -88,7 +88,7 @@ impl<'a, E: Environment, V: Evaluator<E>> MCTS<'a, E, V> {
             self.run_simulation(env, &mut root).await;
         }
 
-        let mut counts = vec![0u32; E::Action::NUM_ACTIONS];
+        let mut counts = vec![0u32; E::NUM_ACTIONS];
         for (action, child) in &root.children {
             counts[action.to_index()] = child.visit_count;
         }

@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use crate::queue::GpuJobQueue;
-use crate::{Action, Environment};
+use crate::Environment;
 
 /// Output from neural network evaluation: (policy logits, value).
 /// Policy has one entry per possible action, value is in [-1, 1].
@@ -23,9 +23,6 @@ impl<const NUM_ACTIONS: usize> Default for PolicyValue<NUM_ACTIONS> {
 }
 
 /// Async evaluator trait for neural network inference.
-///
-/// This replaces the sync `Evaluator` trait from `mcts.rs` for use with
-/// the async executor and GPU batching.
 pub trait Evaluator<E: Environment> {
     /// Evaluate the environment and return (policy, value).
     /// Policy is over all actions, value is in [-1, 1] from current player's perspective.
@@ -73,7 +70,7 @@ pub struct UniformEvaluator;
 
 impl<E: Environment> Evaluator<E> for UniformEvaluator {
     fn evaluate(&self, _env: &E) -> impl Future<Output = (Vec<f32>, f32)> {
-        let num_actions = E::Action::NUM_ACTIONS;
+        let num_actions = E::NUM_ACTIONS;
         let policy = vec![1.0 / num_actions as f32; num_actions];
         std::future::ready((policy, 0.0))
     }
@@ -116,7 +113,6 @@ where
 mod tests {
     use super::*;
     use crate::environments::TicTacToe;
-    use crate::Action;
 
     #[test]
     fn test_uniform_evaluator() {
@@ -189,12 +185,11 @@ mod tests {
 
     #[test]
     fn test_gpu_evaluator() {
-        use crate::environments::TicTacToeAction;
         use crate::queue::BATCH_SIZE;
         use std::sync::Arc;
 
         // Create a mock GPU queue that returns uniform policy
-        type Output = PolicyValue<{ TicTacToeAction::NUM_ACTIONS }>;
+        type Output = PolicyValue<{ TicTacToe::NUM_ACTIONS }>;
         let queue: Arc<GpuJobQueue<[u8; 9], Output>> = Arc::new(GpuJobQueue::new(
             |_inputs: &[[u8; 9]], outputs: &mut [Output]| {
                 for output in outputs.iter_mut() {

@@ -51,11 +51,10 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Run all futures to completion.
+    /// Run futures until completion or cancellation.
     ///
     /// Polls all futures in round-robin. When no future makes progress,
     /// parks until the GPU signals batch completion.
-    /// Run futures until completion or cancellation.
     ///
     /// If `cancel()` returns true at any checkpoint, all remaining futures are
     /// dropped and the function returns immediately.
@@ -68,7 +67,7 @@ impl<'a> Executor<'a> {
         let mut cx = Context::from_waker(&waker);
 
         loop {
-            if cancel() {
+            if cancel() || futures.is_empty() {
                 return;
             }
 
@@ -82,9 +81,8 @@ impl<'a> Executor<'a> {
                 while i < futures.len() {
                     match futures[i].as_mut().poll(&mut cx) {
                         Poll::Ready(()) => {
-                            // Future completed - remove it
                             futures.swap_remove(i);
-                            signal_progress(); // Completion is progress
+                            signal_progress();
                         }
                         Poll::Pending => {
                             i += 1;
@@ -98,12 +96,7 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            // All futures done?
             if futures.is_empty() {
-                return;
-            }
-
-            if cancel() {
                 return;
             }
 
@@ -125,7 +118,7 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            if cancel() {
+            if cancel() || futures.is_empty() {
                 return;
             }
 

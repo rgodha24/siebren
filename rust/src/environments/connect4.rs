@@ -9,8 +9,6 @@ const COLS: usize = 7;
 pub struct Connect4Action(pub usize);
 
 impl Action for Connect4Action {
-    const NUM_ACTIONS: usize = COLS;
-
     fn to_index(self) -> usize {
         self.0
     }
@@ -94,6 +92,7 @@ impl Environment for Connect4 {
     type Observation = Array2<i8>;
     type Action = Connect4Action;
     type RollbackState = Connect4Rollback;
+    const NUM_ACTIONS: usize = COLS;
 
     fn new() -> Self {
         Self {
@@ -166,7 +165,7 @@ mod tests {
         assert_eq!(Connect4Action::from_index(0), Some(Connect4Action(0)));
         assert_eq!(Connect4Action::from_index(6), Some(Connect4Action(6)));
         assert_eq!(Connect4Action::from_index(7), None);
-        assert_eq!(Connect4Action::NUM_ACTIONS, 7);
+        assert_eq!(Connect4::NUM_ACTIONS, 7);
     }
 
     #[test]

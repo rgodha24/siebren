@@ -62,9 +62,6 @@ pub struct TrainingResult<E: Environment> {
 /// Workers share an atomic counter for games completed. When the target is
 /// reached, remaining workers are cancelled via the executor. This allows
 /// fast workers to complete more games while slow workers are still playing.
-///
-/// Note: Due to Rust's const generics limitations, `NUM_ACTIONS` must be specified
-/// as a const generic parameter rather than inferred from the Environment.
 pub fn run_training<E, const NUM_ACTIONS: usize, F>(
     config: TrainingConfig,
     dispatch: F,
@@ -126,79 +123,60 @@ where
     E::Observation: Copy + Default,
 {
     use std::cell::RefCell;
-    use std::rc::Rc;
 
-    // Create thread-local RNGs for each worker
     let base_seed = config.seed.wrapping_add(thread_id as u64 * 1000);
+    let evaluator = GpuEvaluator::<E, NUM_ACTIONS>::new(&*queue);
 
-    // Create evaluator that uses the shared queue
-    let evaluator = Rc::new(GpuEvaluator::<E, NUM_ACTIONS>::new(&*queue));
-    let worker_config = Rc::new(config.worker.clone());
+    let worker_samples: Vec<_> = (0..config.workers_per_thread)
+        .map(|_| RefCell::new(Vec::new()))
+        .collect();
 
-    // Create executor with cancel callback that checks if target is reached
-    let games_completed_for_cancel = games_completed.clone();
-    let executor = Executor::new(|| queue.listen());
-
-    // Collect samples from all workers
-    let all_samples: Rc<RefCell<Vec<TrainingSample<E>>>> = Rc::new(RefCell::new(Vec::new()));
-
-    // Create worker futures
     let futures: Vec<_> = (0..config.workers_per_thread)
         .map(|i| {
-            let evaluator = evaluator.clone();
-            let worker_config = worker_config.clone();
-            let all_samples = all_samples.clone();
             let games_completed = games_completed.clone();
             let mut rng = ChaCha8Rng::seed_from_u64(base_seed + i as u64);
+            let samples_ref = &worker_samples[i];
+            let evaluator_ref = &evaluator;
+            let worker_config = &config.worker;
 
             async move {
-                let samples = worker_loop::<E, _, _>(
-                    &*evaluator,
-                    &worker_config,
+                worker_loop::<E, _, _>(
+                    evaluator_ref,
+                    worker_config,
                     &mut rng,
                     games_completed,
                     target_games,
+                    &mut samples_ref.borrow_mut(),
                 )
                 .await;
-                all_samples.borrow_mut().extend(samples);
             }
         })
         .collect();
 
-    // Run all workers until target games reached
+    let executor = Executor::new(|| queue.listen());
     executor.run(
         futures
             .into_iter()
             .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
             .collect(),
         || {
-            // Cancel when we've reached the target
-            let done = games_completed_for_cancel.load(Ordering::Acquire) >= target_games;
+            let done = games_completed.load(Ordering::Acquire) >= target_games;
             if done {
-                // Wake any blocked workers so they can exit
                 queue.notify_all();
             }
             done
         },
     );
 
-    // Log completion
-    let samples_count = all_samples.borrow().len();
+    let all_samples: Vec<TrainingSample<E>> = worker_samples
+        .into_iter()
+        .flat_map(|cell| cell.into_inner())
+        .collect();
+
     eprintln!(
-        "Thread {}: finished with {} samples collected locally",
-        thread_id, samples_count
+        "Thread {thread_id}: finished with {} samples collected",
+        all_samples.len()
     );
 
-    // Extract and return samples
-    match Rc::try_unwrap(all_samples) {
-        Ok(cell) => cell.into_inner(),
-        Err(_) => panic!("samples Rc should be unique after executor completes"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Integration tests would go here, but they require a lot of setup
-    // and would take too long to run in unit test context.
-    // See the examples/ directory for full integration tests.
+    all_samples
 }

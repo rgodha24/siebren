@@ -12,7 +12,7 @@ use crate::mcts::{best_action_index, sample_action_index, visits_to_policy, MCTS
 use crate::{Action, Environment, TerminalState};
 
 /// A training sample from a single game step.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TrainingSample<E: Environment> {
     /// The environment state at this step.
     pub env: E,
@@ -64,14 +64,11 @@ where
     let mcts = MCTS::new(evaluator, &config.mcts);
 
     loop {
-        // Check for terminal before searching
         if env.is_terminal().is_some() {
             break;
         }
 
-        // Run MCTS search
         let visits = mcts.search(&mut env, rng).await;
-
         // Convert visits to policy
         let temp = if move_count < config.exploration_moves {
             config.temperature
@@ -140,41 +137,30 @@ fn backfill_values<E: Environment>(samples: &mut [TrainingSample<E>], outcome: T
 /// When the counter reaches `target_games`, workers stop. The executor's
 /// cancel callback should check this condition to terminate remaining workers.
 ///
-/// Returns the collected samples from this worker.
+/// Samples are pushed to `samples_out` after each completed game. This ensures
+/// samples are preserved even if the future is cancelled mid-execution.
 pub async fn worker_loop<E, V, R>(
     evaluator: &V,
     config: &WorkerConfig,
     rng: &mut R,
     games_completed: Arc<AtomicUsize>,
     target_games: usize,
-) -> Vec<TrainingSample<E>>
-where
+    samples_out: &mut Vec<TrainingSample<E>>,
+) where
     E: Environment + Clone,
     V: Evaluator<E>,
     R: Rng,
 {
-    let mut samples = Vec::new();
-
     loop {
-        // Check if target already reached before starting a new game
         if games_completed.load(Ordering::Acquire) >= target_games {
             break;
         }
 
-        // Play a game
         let game_samples = play_game::<E, V, R>(evaluator, config, rng).await;
-        samples.extend(game_samples);
+        samples_out.extend(game_samples);
 
-        // Increment completed counter
-        let completed = games_completed.fetch_add(1, Ordering::AcqRel) + 1;
-
-        // If we just hit the target, we're done
-        if completed >= target_games {
-            break;
-        }
+        games_completed.fetch_add(1, Ordering::AcqRel);
     }
-
-    samples
 }
 
 #[cfg(test)]
