@@ -133,8 +133,7 @@ impl PartialEq for Map {
                 .flatten()
                 .zip(other.trap_mask.iter().flatten())
                 .all(|(left, right)| {
-                    (left.abs() <= self.turn_count as i16
-                        && right.abs() <= self.turn_count as i16)
+                    (left.abs() <= self.turn_count as i16 && right.abs() <= self.turn_count as i16)
                         || left == right
                 })
     }

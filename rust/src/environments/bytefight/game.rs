@@ -6,7 +6,9 @@ use rand::Rng;
 
 use super::map::{add_padding_walls, Map};
 use super::snake::Snake;
-use super::types::{BoardHeuristics, ByteFightAction, Point, TerminalState, ValidMoves, HEURISTICS_SIZE};
+use super::types::{
+    BoardHeuristics, ByteFightAction, Point, TerminalState, ValidMoves, HEURISTICS_SIZE,
+};
 
 pub const APPLE_REWARD: usize = 2;
 const TRAP_LIFETIME: i16 = 100;
@@ -450,7 +452,15 @@ impl Board {
             apple_timeline_ptr: 0,
             apple_timeline: queued_apples
                 .into_iter()
-                .map(|(turn, point)| (turn, Point { x: point.0, y: point.1 }))
+                .map(|(turn, point)| {
+                    (
+                        turn,
+                        Point {
+                            x: point.0,
+                            y: point.1,
+                        },
+                    )
+                })
                 .collect(),
             is_player_a,
             min_player_size,
@@ -531,7 +541,10 @@ impl Board {
         }
 
         if active_snake.can_afford_movement(self.min_player_size) {
-            let head = active_snake.segment_queue.front().expect("snake head missing");
+            let head = active_snake
+                .segment_queue
+                .front()
+                .expect("snake head missing");
 
             let offsets = if active_snake.current_direction.is_some() {
                 6..11
@@ -540,9 +553,11 @@ impl Board {
             };
 
             for offset in offsets {
-                let direction_int =
-                    (offset + active_snake.current_direction.unwrap_or(ByteFightAction::North) as u8)
-                        % 8;
+                let direction_int = (offset
+                    + active_snake
+                        .current_direction
+                        .unwrap_or(ByteFightAction::North) as u8)
+                    % 8;
 
                 let Some(new_loc) = head.try_add_int(direction_int) else {
                     continue;
@@ -572,9 +587,8 @@ impl Board {
                     <= active_snake.length() + apple_reward - self.min_player_size;
 
                 if not_wall && not_snake && (not_trap || can_facetank_trap) && portal_is_valid {
-                    valid_moves.add(
-                        ByteFightAction::new(direction_int).expect("direction_int is valid"),
-                    );
+                    valid_moves
+                        .add(ByteFightAction::new(direction_int).expect("direction_int is valid"));
                 }
             }
         }
@@ -1203,7 +1217,10 @@ fn parse_pair(value: &str, delimiter: char) -> Result<(usize, usize), String> {
     if iter.next().is_some() {
         return Err("too many parts".to_string());
     }
-    Ok((parse_usize(first, "pair_x")?, parse_usize(second, "pair_y")?))
+    Ok((
+        parse_usize(first, "pair_x")?,
+        parse_usize(second, "pair_y")?,
+    ))
 }
 
 fn parse_point(value: &str) -> Result<Point, String> {

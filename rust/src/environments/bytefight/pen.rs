@@ -275,7 +275,11 @@ fn parse_decay(section: &str, prefix: char) -> Result<(usize, usize, bool), PenE
     Ok((countdown, interval, is_decaying))
 }
 
-fn parse_prefixed_walls(section: &str, width: usize, height: usize) -> Result<Vec<Point>, PenError> {
+fn parse_prefixed_walls(
+    section: &str,
+    width: usize,
+    height: usize,
+) -> Result<Vec<Point>, PenError> {
     let value = section
         .strip_prefix('w')
         .ok_or_else(|| PenError::new("missing walls prefix"))?;
@@ -407,9 +411,10 @@ fn parse_prefixed_snake(section: &str, prefix: char) -> Result<Snake, PenError> 
     let direction = if parts[0] == "-" {
         None
     } else {
-        Some(ByteFightAction::new(parse_usize(parts[0], "direction")? as u8).ok_or_else(|| {
-            PenError::new("invalid direction value")
-        })?)
+        Some(
+            ByteFightAction::new(parse_usize(parts[0], "direction")? as u8)
+                .ok_or_else(|| PenError::new("invalid direction value"))?,
+        )
     };
 
     let queued_length = parse_usize(parts[1], "queued_length")?;
@@ -456,7 +461,10 @@ fn parse_pair(value: &str, delimiter: char) -> Result<(usize, usize), PenError> 
     if iter.next().is_some() {
         return Err(PenError::new("too many parts"));
     }
-    Ok((parse_usize(first, "pair_x")?, parse_usize(second, "pair_y")?))
+    Ok((
+        parse_usize(first, "pair_x")?,
+        parse_usize(second, "pair_y")?,
+    ))
 }
 
 fn parse_point(value: &str) -> Result<Point, PenError> {

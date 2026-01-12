@@ -93,6 +93,39 @@ pub enum TerminalState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct ValidMoves(u16);
 
+#[derive(Debug, Clone)]
+pub struct ValidMovesIter {
+    mask: u16,
+    index: u8,
+}
+
+impl Iterator for ValidMovesIter {
+    type Item = ByteFightAction;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index <= 10 {
+            let idx = self.index;
+            self.index += 1;
+            if self.mask & (1 << idx) != 0 {
+                return Some(ByteFightAction::new(idx).expect("0..=10 is always a valid action"));
+            }
+        }
+        None
+    }
+}
+
+impl IntoIterator for ValidMoves {
+    type Item = ByteFightAction;
+    type IntoIter = ValidMovesIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ValidMovesIter {
+            mask: self.0,
+            index: 0,
+        }
+    }
+}
+
 impl ValidMoves {
     #[inline]
     pub fn add(&mut self, action: ByteFightAction) {
@@ -132,10 +165,8 @@ impl ValidMoves {
         (start, end)
     }
 
-    pub fn actions(&self) -> impl Iterator<Item = ByteFightAction> + '_ {
-        (0..=10)
-            .filter(|i| self.0 & (1 << i) != 0)
-            .map(|i| ByteFightAction::new(i as u8).expect("0..=10 is always a valid action"))
+    pub fn actions(self) -> ValidMovesIter {
+        self.into_iter()
     }
 }
 

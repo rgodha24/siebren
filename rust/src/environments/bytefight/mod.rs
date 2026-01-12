@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Action as ActionTrait, Environment, Player, TerminalState};
+use crate::{Environment, Player, TerminalState};
 
 pub mod game;
 pub mod map;
@@ -68,11 +68,7 @@ impl Environment for ByteFight {
     }
 
     fn valid_actions(&self) -> impl Iterator<Item = Self::Action> {
-        self.board
-            .get_valid_moves()
-            .actions()
-            .collect::<Vec<_>>()
-            .into_iter()
+        self.board.get_valid_moves().actions()
     }
 
     fn current_player(&self) -> Player {
@@ -100,6 +96,7 @@ impl Environment for ByteFight {
 
 #[cfg(test)]
 mod tests {
+    use crate::Action;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
