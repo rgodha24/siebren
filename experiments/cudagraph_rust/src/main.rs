@@ -1,6 +1,7 @@
 use cudarc::runtime::sys as cuda;
 use pyo3::ffi;
 use pyo3::prelude::*;
+use std::env;
 use std::ffi::{c_void, CStr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +45,7 @@ struct DLPackContext {
 }
 
 const DL_TENSOR_NAME: &[u8] = b"dltensor\0";
+const DL_DEVICE_CPU: i32 = 1;
 const DL_DEVICE_CUDA: i32 = 2;
 const DL_DTYPE_FLOAT: u8 = 2;
 
@@ -91,6 +93,7 @@ fn dlpack_capsule(
     py: Python<'_>,
     data: *mut c_void,
     shape: &[i64],
+    device_type: i32,
     device_id: i32,
 ) -> PyResult<PyObject> {
     let ctx = Box::new(DLPackContext {
@@ -104,7 +107,7 @@ fn dlpack_capsule(
         dl_tensor: DLTensor {
             data,
             device: DLDevice {
-                device_type: DL_DEVICE_CUDA,
+                device_type,
                 device_id,
             },
             ndim: shape.len() as i32,
@@ -170,7 +173,74 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn ensure_python_path(py: Python<'_>) -> PyResult<()> {
+    let sys = PyModule::import(py, "sys")?;
+    let sys_path = sys.getattr("path")?;
+    sys_path.call_method1("insert", (0, workspace_root().to_string_lossy().as_ref()))?;
+    Ok(())
+}
+
+fn call_python_callback<'py>(
+    callback: &pyo3::Bound<'py, PyAny>,
+    input: &pyo3::Bound<'py, PyAny>,
+) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    callback.call1((input,))
+}
+
+fn cpu_tensor_from_dlpack<'py>(
+    py: Python<'py>,
+    data: &mut [f32],
+    shape: &[i64],
+) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    let dlpack = PyModule::import(py, "torch.utils.dlpack")?;
+    let capsule = dlpack_capsule(
+        py,
+        data.as_mut_ptr() as *mut c_void,
+        shape,
+        DL_DEVICE_CPU,
+        0,
+    )?;
+    dlpack.getattr("from_dlpack")?.call1((capsule,))
+}
+
+fn load_callback<'py>(py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    let spec = env::var("CPU_CALLBACK")
+        .unwrap_or_else(|_| "experiments.cpu_callback:cpu_callback".to_string());
+    let (module_name, attr_name) = spec.split_once(':').ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("CPU_CALLBACK must be 'module:callable'")
+    })?;
+    let module = PyModule::import(py, module_name)?;
+    module.getattr(attr_name)
+}
+
+fn run_cpu_callback_with<'py>(
+    py: Python<'py>,
+    callback: &pyo3::Bound<'py, PyAny>,
+) -> PyResult<Vec<f32>> {
+    let shape = [4_i64, 8_i64];
+    let elems = (shape[0] * shape[1]) as usize;
+    let mut input: Vec<f32> = (0..elems).map(|i| i as f32).collect();
+    let input_tensor = cpu_tensor_from_dlpack(py, &mut input, &shape)?;
+    let output = call_python_callback(callback, &input_tensor)?;
+    let output_flat = output.call_method0("flatten")?;
+    let output_vec: Vec<f32> = output_flat.call_method0("tolist")?.extract()?;
+    Ok(output_vec)
+}
+
+fn run_cpu_callback() -> PyResult<Vec<f32>> {
+    Python::with_gil(|py| {
+        ensure_python_path(py)?;
+        let callback = load_callback(py)?;
+        run_cpu_callback_with(py, &callback)
+    })
+}
+
 fn main() -> PyResult<()> {
+    let cpu_output = run_cpu_callback()?;
+    if let Some(sample) = cpu_output.first() {
+        println!("cpu callback output[0]={:.5}", sample);
+    }
+
     let device_id = 0;
     let batch = 8_i64;
     let channels = 24_i64;
@@ -246,15 +316,14 @@ fn main() -> PyResult<()> {
     }
 
     let exec_handle = Python::with_gil(|py| -> PyResult<u64> {
-        let sys = PyModule::import(py, "sys")?;
-        let sys_path = sys.getattr("path")?;
-        sys_path.call_method1("insert", (0, workspace_root().to_string_lossy().as_ref()))?;
+        ensure_python_path(py)?;
 
         let module = PyModule::import(py, "experiments.cudagraph_capture")?;
-        let board_capsule = dlpack_capsule(py, d_board, &board_shape, device_id)?;
-        let heur_capsule = dlpack_capsule(py, d_heur, &heur_shape, device_id)?;
-        let value_capsule = dlpack_capsule(py, d_value, &value_shape, device_id)?;
-        let policy_capsule = dlpack_capsule(py, d_policy, &policy_shape, device_id)?;
+        let board_capsule = dlpack_capsule(py, d_board, &board_shape, DL_DEVICE_CUDA, device_id)?;
+        let heur_capsule = dlpack_capsule(py, d_heur, &heur_shape, DL_DEVICE_CUDA, device_id)?;
+        let value_capsule = dlpack_capsule(py, d_value, &value_shape, DL_DEVICE_CUDA, device_id)?;
+        let policy_capsule =
+            dlpack_capsule(py, d_policy, &policy_shape, DL_DEVICE_CUDA, device_id)?;
         let exec_handle: u64 = module
             .getattr("capture_graph")?
             .call1((

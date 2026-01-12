@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 pyo3 = { version = "0.25.0", features = ["auto-initialize"] }
+ndarray = "0.15.6"
+numpy = "0.25.0"
 cudarc = { version = "0.18.2", features = ["cuda-version-from-build-system"] }
 
 [build-dependencies]

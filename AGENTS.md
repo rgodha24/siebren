@@ -7,14 +7,15 @@ AlphaZero-style game engine training infrastructure. Rust core with Python bindi
 ```bash
 # IMPORTANT: All commands must be prefixed with `nix develop -c`
 # Python commands: `nix develop -c uv run ...`
+# Cargo from repo root: add `--manifest-path rust/Cargo.toml`
 
 # Build
 nix develop -c maturin develop          # Build Rust extension for Python
 
 # Rust tests
-nix develop -c cargo test               # Run all tests (from rust/ directory)
-nix develop -c cargo test test_name     # Run single test
-nix develop -c cargo test -- --nocapture  # Show println! output
+nix develop -c cargo test --manifest-path rust/Cargo.toml               # Run all tests (from repo root)
+nix develop -c cargo test --manifest-path rust/Cargo.toml test_name     # Run single test
+nix develop -c cargo test --manifest-path rust/Cargo.toml -- --nocapture  # Show println! output
 
 # Python tests
 nix develop -c uv run pytest src/tests/              # Run all tests
