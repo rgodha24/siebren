@@ -97,10 +97,12 @@ impl Environment for ByteFight {
 #[cfg(test)]
 mod tests {
     use crate::Action;
-    use rand::SeedableRng;
+    use rand::{RngCore, SeedableRng};
     use rand_chacha::ChaCha8Rng;
+    use rstest::rstest;
 
     use super::*;
+
 
     #[test]
     fn test_action_trait() {
@@ -121,5 +123,50 @@ mod tests {
         let pen = ByteFightPen::from(&board);
         let rebuilt = pen.clone().into_board().expect("valid pen");
         assert_eq!(pen.0, ByteFightPen::from(&rebuilt).0);
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(7)]
+    #[case(13)]
+    #[case(23)]
+    #[case(42)]
+    #[case(77)]
+    #[case(101)]
+    #[case(123)]
+    #[case(256)]
+    #[case(999)]
+    fn test_random_move_sequence_roundtrip(#[case] seed: u64) {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        for _ in 0..5 {
+            let mut board = game::Board::new_random(&mut rng);
+            let mut snapshots = Vec::new();
+            let mut snapshot_pens = Vec::new();
+            snapshots.push(board.clone());
+            snapshot_pens.push(ByteFightPen::from(&board).0);
+
+            let mut rollbacks = Vec::new();
+
+            for _ in 0..150 {
+                let valid: Vec<_> = board.get_valid_moves().actions().collect();
+                if valid.is_empty() {
+                    break;
+                }
+                let idx = (rng.next_u64() as usize) % valid.len();
+                let action = valid[idx];
+                let rollback = board.apply_move(action).expect("valid move");
+                rollbacks.push(rollback);
+                snapshots.push(board.clone());
+                snapshot_pens.push(ByteFightPen::from(&board).0);
+            }
+
+            for (idx, rollback) in rollbacks.into_iter().rev().enumerate() {
+                board.rollback(rollback);
+                let snapshot_idx = snapshots.len() - 2 - idx;
+                assert_eq!(board, snapshots[snapshot_idx]);
+                assert_eq!(ByteFightPen::from(&board).0, snapshot_pens[snapshot_idx]);
+            }
+        }
     }
 }

@@ -173,3 +173,26 @@ impl ValidMoves {
 pub const HEURISTICS_SIZE: usize = 18;
 
 pub type BoardHeuristics = [f32; HEURISTICS_SIZE];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_moves_iter_order() {
+        let mut moves = ValidMoves::default();
+        moves.add(ByteFightAction::West);
+        moves.add(ByteFightAction::North);
+        moves.add(ByteFightAction::Trap);
+
+        let collected: Vec<_> = moves.actions().collect();
+        assert_eq!(
+            collected,
+            vec![
+                ByteFightAction::North,
+                ByteFightAction::West,
+                ByteFightAction::Trap,
+            ]
+        );
+    }
+}

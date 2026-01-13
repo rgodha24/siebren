@@ -471,3 +471,40 @@ fn parse_point(value: &str) -> Result<Point, PenError> {
     let (x, y) = parse_pair(value, ',')?;
     Ok(Point { x, y })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pen_roundtrip_with_state() {
+        let mut board = Board::new_from_state(
+            (6, 6),
+            vec![(0, (1, 1)), (5, (2, 2))],
+            vec![(0, 0), (3, 4)],
+            vec![],
+            vec![((0, 0), (5, 5))],
+            vec![(5, (4, 1)), (-5, (1, 4))],
+            vec![(2, 2)],
+            1,
+            2,
+            0,
+            Some(ByteFightAction::East),
+            vec![(4, 4)],
+            1,
+            2,
+            0,
+            Some(ByteFightAction::West),
+            3,
+            1,
+            true,
+            2,
+            12,
+            true,
+        );
+        board.apple_timeline_ptr = 1;
+        let pen = ByteFightPen::from(&board);
+        let rebuilt = pen.clone().into_board().expect("valid pen");
+        assert_eq!(pen.0, ByteFightPen::from(&rebuilt).0);
+    }
+}
