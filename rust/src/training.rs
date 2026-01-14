@@ -3,10 +3,12 @@
 //! This module provides the entry point for running parallel self-play
 //! with GPU-batched inference.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use ndarray::ArrayView;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -14,7 +16,7 @@ use crate::eval::{GpuEvaluator, PolicyValue};
 use crate::executor::Executor;
 use crate::queue::GpuJobQueue;
 use crate::worker::{worker_loop, TrainingSample, WorkerConfig};
-use crate::Environment;
+use crate::{BatchDim, Environment};
 
 /// Configuration for the training run.
 #[derive(Clone)]
@@ -57,7 +59,8 @@ pub struct TrainingResult<E: Environment> {
 /// async workers. All workers share a single GPU job queue for batched inference.
 ///
 /// The `dispatch` callback is called when a batch of observations is ready
-/// for GPU inference. It should fill the output policy/value pairs.
+/// for GPU inference. It receives a zero-copy view of the batched observations
+/// and should fill the output policy/value pairs.
 ///
 /// Workers share an atomic counter for games completed. When the target is
 /// reached, remaining workers are cancelled via the executor. This allows
@@ -68,17 +71,22 @@ pub fn run_training<E, const NUM_ACTIONS: usize, F>(
 ) -> TrainingResult<E>
 where
     E: Environment + Clone + Send + 'static,
-    E::Observation: Copy + Default + Send + Sync,
-    F: Fn(&[E::Observation], &mut [PolicyValue<NUM_ACTIONS>]) + Send + Sync + 'static,
+    E::ObsDim: BatchDim,
+    F: Fn(
+            ArrayView<E::ObsElem, <E::ObsDim as BatchDim>::BatchedDim>,
+            &mut [PolicyValue<NUM_ACTIONS>],
+        ) + Send
+        + Sync
+        + 'static,
 {
     let target_games = config.total_games;
 
     // Shared counter for games completed across all workers
     let games_completed = Arc::new(AtomicUsize::new(0));
 
-    // Create shared GPU queue
-    let queue: Arc<GpuJobQueue<E::Observation, PolicyValue<NUM_ACTIONS>>> =
-        Arc::new(GpuJobQueue::new(dispatch));
+    // Create shared GPU queue with observation shape
+    let queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>> =
+        Arc::new(GpuJobQueue::new(E::OBS_SHAPE, dispatch));
 
     // Spawn worker threads
     let mut handles = Vec::with_capacity(config.num_threads);
@@ -113,17 +121,15 @@ where
 /// Returns all samples collected by this thread.
 fn run_thread<E, const NUM_ACTIONS: usize>(
     thread_id: usize,
-    queue: Arc<GpuJobQueue<E::Observation, PolicyValue<NUM_ACTIONS>>>,
+    queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>>,
     config: TrainingConfig,
     games_completed: Arc<AtomicUsize>,
     target_games: usize,
 ) -> Vec<TrainingSample<E>>
 where
     E: Environment + Clone + 'static,
-    E::Observation: Copy + Default,
+    E::ObsDim: BatchDim,
 {
-    use std::cell::RefCell;
-
     let base_seed = config.seed.wrapping_add(thread_id as u64 * 1000);
     let evaluator = GpuEvaluator::<E, NUM_ACTIONS>::new(&*queue);
 

@@ -1,4 +1,4 @@
-use ndarray::Array2;
+use ndarray::{ArrayViewMut, Ix2};
 
 use crate::{Action, Environment, Player, TerminalState};
 
@@ -89,10 +89,12 @@ impl Connect4 {
 }
 
 impl Environment for Connect4 {
-    type Observation = Array2<i8>;
+    type ObsElem = i8;
+    type ObsDim = Ix2;
     type Action = Connect4Action;
     type RollbackState = Connect4Rollback;
     const NUM_ACTIONS: usize = COLS;
+    const OBS_SHAPE: Ix2 = Ix2(ROWS, COLS);
 
     fn new() -> Self {
         Self {
@@ -122,12 +124,16 @@ impl Environment for Connect4 {
         self.current_player
     }
 
-    fn observation(&self) -> Self::Observation {
-        Array2::from_shape_fn((ROWS, COLS), |(row, col)| match self.board[row][col] {
-            Some(Player::PlayerA) => 1,
-            Some(Player::PlayerB) => -1,
-            None => 0,
-        })
+    fn observation(&self, mut out: ArrayViewMut<i8, Ix2>) {
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                out[[row, col]] = match self.board[row][col] {
+                    Some(Player::PlayerA) => 1,
+                    Some(Player::PlayerB) => -1,
+                    None => 0,
+                };
+            }
+        }
     }
 
     fn apply_action(&mut self, action: Self::Action) -> Self::RollbackState {
@@ -290,11 +296,14 @@ mod tests {
 
     #[test]
     fn test_observation() {
+        use ndarray::Array2;
+
         let mut game = Connect4::new();
         game.apply_action(Connect4Action(3)); // A at (5, 3)
         game.apply_action(Connect4Action(3)); // B at (4, 3)
 
-        let obs = game.observation();
+        let mut obs = Array2::<i8>::zeros((ROWS, COLS));
+        game.observation(obs.view_mut());
         assert_eq!(obs.shape(), &[6, 7]);
         assert_eq!(obs[[5, 3]], 1); // PlayerA
         assert_eq!(obs[[4, 3]], -1); // PlayerB

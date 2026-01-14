@@ -8,6 +8,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    use ndarray::Ix1;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -25,10 +26,10 @@ mod tests {
         let dispatch_count = Arc::new(AtomicUsize::new(0));
         let dispatch_count_clone = dispatch_count.clone();
 
-        type Obs = [u8; 9];
         type Output = PolicyValue<9>;
-        let queue: Arc<GpuJobQueue<Obs, Output>> = Arc::new(GpuJobQueue::new(
-            move |_inputs: &[Obs], outputs: &mut [Output]| {
+        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+            TicTacToe::OBS_SHAPE,
+            move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
@@ -75,10 +76,10 @@ mod tests {
         let dispatch_count = Arc::new(AtomicUsize::new(0));
         let dispatch_count_clone = dispatch_count.clone();
 
-        type Obs = [u8; 9];
         type Output = PolicyValue<9>;
-        let queue: Arc<GpuJobQueue<Obs, Output>> = Arc::new(GpuJobQueue::new(
-            move |_inputs: &[Obs], outputs: &mut [Output]| {
+        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+            TicTacToe::OBS_SHAPE,
+            move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
@@ -124,10 +125,10 @@ mod tests {
         let dispatch_count = Arc::new(AtomicUsize::new(0));
         let dispatch_count_clone = dispatch_count.clone();
 
-        type Obs = [u8; 9];
         type Output = PolicyValue<9>;
-        let queue: Arc<GpuJobQueue<Obs, Output>> = Arc::new(GpuJobQueue::new(
-            move |_inputs: &[Obs], outputs: &mut [Output]| {
+        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+            TicTacToe::OBS_SHAPE,
+            move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];

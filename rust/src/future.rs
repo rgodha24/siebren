@@ -1,16 +1,17 @@
 //! Future implementation for GPU evaluation requests.
 //!
-//! GpuEvalFuture represents a pending GPU inference job. It transitions through:
-//! 1. NotSubmitted - contains input, first poll submits to queue
-//! 2. Pending - waiting for batch to complete
-//! 3. Ready - result available (Future returns Poll::Ready)
+//! GpuEvalFuture represents a pending GPU inference job. The observation
+//! is submitted immediately when the future is created, so the future
+//! just polls for completion.
 
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use ndarray::Dimension;
+
 use crate::queue::GpuJobQueue;
+use crate::BatchDim;
 
 // Thread-local flag for tracking whether any future made progress.
 // Used by the executor to decide whether to park.
@@ -28,107 +29,93 @@ pub fn take_progress() -> bool {
     MADE_PROGRESS.with(|p| p.replace(false))
 }
 
-/// State of a GPU evaluation future.
-enum State<I> {
-    /// Input ready to submit on first poll.
-    NotSubmitted(I),
-    /// Submitted, waiting for result.
-    Pending { ticket: u64 },
-    /// Already completed (for safety, shouldn't be polled again).
-    Completed,
-}
-
 /// A future representing a GPU evaluation request.
 ///
-/// On first poll, submits the input to the queue and transitions to Pending.
-/// Subsequent polls check if the batch is complete.
-pub struct GpuEvalFuture<'a, I, O>
+/// The observation is submitted when this future is created (not on first poll).
+/// Polling checks if the batch containing this job is complete.
+pub struct GpuEvalFuture<'a, A, D, O>
 where
-    I: Copy + Default,
-    O: Copy + Default,
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    D::Larger: Dimension,
+    O: Copy + Default + Send + Sync,
 {
-    queue: &'a GpuJobQueue<I, O>,
-    state: State<I>,
-    _phantom: PhantomData<O>,
+    queue: &'a GpuJobQueue<A, D, O>,
+    ticket: u64,
+    completed: bool,
 }
 
-impl<'a, I, O> GpuEvalFuture<'a, I, O>
+impl<'a, A, D, O> GpuEvalFuture<'a, A, D, O>
 where
-    I: Copy + Default,
-    O: Copy + Default,
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    D::Larger: Dimension,
+    O: Copy + Default + Send + Sync,
 {
-    /// Create a new future that will submit the input on first poll.
-    pub fn new(queue: &'a GpuJobQueue<I, O>, input: I) -> Self {
+    /// Create a new future with an already-submitted ticket.
+    pub fn new(queue: &'a GpuJobQueue<A, D, O>, ticket: u64) -> Self {
+        // Signal progress on creation since we just submitted
+        signal_progress();
         Self {
             queue,
-            state: State::NotSubmitted(input),
-            _phantom: PhantomData,
+            ticket,
+            completed: false,
         }
     }
 }
 
-impl<'a, I, O> Future for GpuEvalFuture<'a, I, O>
+impl<'a, A, D, O> Future for GpuEvalFuture<'a, A, D, O>
 where
-    I: Copy + Default,
-    O: Copy + Default,
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    D::Larger: Dimension,
+    O: Copy + Default + Send + Sync,
 {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: We don't move out of self, just update state
+        // SAFETY: We don't move out of self, just update completed flag
         let this = unsafe { self.get_unchecked_mut() };
 
-        match &this.state {
-            State::NotSubmitted(input) => {
-                // First poll: submit to queue
-                let input = *input;
-                let ticket = this.queue.submit(input);
-                this.state = State::Pending { ticket };
+        if this.completed {
+            panic!("GpuEvalFuture polled after completion");
+        }
 
-                // Signal progress: we did work (submitted a job)
-                signal_progress();
-
-                // Immediately check if already complete (might be if we triggered batch)
-                if let Some(&output) = this.queue.poll(ticket) {
-                    this.state = State::Completed;
-                    signal_progress();
-                    Poll::Ready(output)
-                } else {
-                    Poll::Pending
-                }
-            }
-            State::Pending { ticket } => {
-                // Subsequent polls: check if result ready
-                if let Some(&output) = this.queue.poll(*ticket) {
-                    this.state = State::Completed;
-                    signal_progress();
-                    Poll::Ready(output)
-                } else {
-                    // No progress - still waiting
-                    Poll::Pending
-                }
-            }
-            State::Completed => {
-                panic!("GpuEvalFuture polled after completion");
-            }
+        if let Some(&output) = this.queue.poll(this.ticket) {
+            this.completed = true;
+            signal_progress();
+            Poll::Ready(output)
+        } else {
+            Poll::Pending
         }
     }
 }
 
-impl<I, O> GpuJobQueue<I, O>
+impl<A, D, O> GpuJobQueue<A, D, O>
 where
-    I: Copy + Default,
-    O: Copy + Default,
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    D::Larger: Dimension,
+    O: Copy + Default + Send + Sync,
 {
-    /// Create a future that will evaluate the input on the GPU.
-    pub fn eval(&self, input: I) -> GpuEvalFuture<'_, I, O> {
-        GpuEvalFuture::new(self, input)
+    /// Submit an observation and create a future that will resolve to the output.
+    ///
+    /// The observation is written immediately via the callback.
+    /// The returned future polls for the batch to complete.
+    pub fn eval<F>(&self, write_obs: F) -> GpuEvalFuture<'_, A, D, O>
+    where
+        F: FnOnce(ndarray::ArrayViewMut<A, D>),
+    {
+        let ticket = self.submit(write_obs);
+        GpuEvalFuture::new(self, ticket)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::BATCH_SIZE;
+    use ndarray::Ix0;
     use std::sync::Arc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
@@ -147,99 +134,85 @@ mod tests {
     }
 
     #[test]
-    fn test_future_submits_on_first_poll() {
-        use crate::queue::BATCH_SIZE;
+    fn test_future_submits_immediately() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let submit_count = Arc::new(AtomicUsize::new(0));
         let submit_count_clone = submit_count.clone();
 
-        let queue: Arc<GpuJobQueue<u64, u64>> =
-            Arc::new(GpuJobQueue::new(move |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), move |inputs, outputs| {
                 submit_count_clone.fetch_add(1, Ordering::SeqCst);
-                for (i, &input) in inputs.iter().enumerate() {
+                for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
             }));
 
-        // Create futures but don't poll yet
-        let mut futures: Vec<_> = (0..BATCH_SIZE as u64).map(|i| queue.eval(i)).collect();
-
         assert_eq!(submit_count.load(Ordering::SeqCst), 0);
 
-        // Poll all futures once
+        // Create futures - they submit immediately
+        let mut futures: Vec<_> = (0..BATCH_SIZE as u64)
+            .map(|i| queue.eval(|mut out| out[()] = i))
+            .collect();
+
+        // Batch should have been dispatched (last eval triggered it)
+        assert_eq!(submit_count.load(Ordering::SeqCst), 1);
+
+        // Poll all futures - they should all be ready
         let waker = dummy_waker();
         let mut cx = Context::from_waker(&waker);
 
         for fut in &mut futures {
-            let _ = Pin::new(fut).poll(&mut cx);
+            match Pin::new(fut).poll(&mut cx) {
+                Poll::Ready(_) => {}
+                Poll::Pending => panic!("future should be ready"),
+            }
         }
-
-        // Batch should have been dispatched
-        assert_eq!(submit_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn test_future_returns_correct_result() {
-        use crate::queue::BATCH_SIZE;
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = input + 100;
+                }
+            }));
 
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input + 100;
-            }
-        }));
-
-        let mut futures: Vec<_> = (0..BATCH_SIZE as u64).map(|i| queue.eval(i)).collect();
+        let mut futures: Vec<_> = (0..BATCH_SIZE as u64)
+            .map(|i| queue.eval(|mut out| out[()] = i))
+            .collect();
 
         let waker = dummy_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // Collect results - some futures may complete on first poll (the one that
-        // triggers batch), others need a second poll
-        let mut results: Vec<Option<u64>> = vec![None; BATCH_SIZE];
-
-        // Poll until all complete
-        for _ in 0..2 {
-            for (i, fut) in futures.iter_mut().enumerate() {
-                if results[i].is_some() {
-                    continue; // Already completed
+        // All should be ready immediately (batch was triggered)
+        for (i, fut) in futures.iter_mut().enumerate() {
+            match Pin::new(fut).poll(&mut cx) {
+                Poll::Ready(result) => {
+                    assert_eq!(result, (i as u64) + 100);
                 }
-                if let Poll::Ready(result) = Pin::new(fut).poll(&mut cx) {
-                    results[i] = Some(result);
-                }
+                Poll::Pending => panic!("future {} should be ready", i),
             }
-        }
-
-        // Verify all completed with correct values
-        for (i, result) in results.iter().enumerate() {
-            let result = result.expect(&format!("Future {} should have completed", i));
-            assert_eq!(result, (i as u64) + 100);
         }
     }
 
     #[test]
     fn test_progress_tracking() {
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input;
-            }
-        }));
-
-        let waker = dummy_waker();
-        let mut cx = Context::from_waker(&waker);
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = *input;
+                }
+            }));
 
         // Clear any previous progress
         take_progress();
 
-        // Create and poll one future (partial batch)
-        let mut fut = queue.eval(0);
-        let _ = Pin::new(&mut fut).poll(&mut cx);
+        // Create one future (partial batch) - should signal progress on creation
+        let _fut = queue.eval(|mut out| out[()] = 0);
 
         // Should have made progress (submitted)
         assert!(take_progress());
-
-        // Poll again - still pending, no progress
-        let _ = Pin::new(&mut fut).poll(&mut cx);
-        assert!(!take_progress());
     }
 }

@@ -1,3 +1,4 @@
+use ndarray::{ArrayView1, ArrayViewMut, Ix1};
 use serde::{Deserialize, Serialize};
 
 use crate::{Environment, Player, TerminalState};
@@ -48,10 +49,12 @@ impl crate::Action for ByteFightAction {
 }
 
 impl Environment for ByteFight {
-    type Observation = types::BoardHeuristics;
+    type ObsElem = f32;
+    type ObsDim = Ix1;
     type Action = ByteFightAction;
     type RollbackState = game::RollbackState;
     const NUM_ACTIONS: usize = 11;
+    const OBS_SHAPE: Ix1 = Ix1(types::HEURISTICS_SIZE);
 
     fn new() -> Self {
         let mut rng = rand::rng();
@@ -79,8 +82,9 @@ impl Environment for ByteFight {
         }
     }
 
-    fn observation(&self) -> Self::Observation {
-        self.board.heuristics()
+    fn observation(&self, mut out: ArrayViewMut<f32, Ix1>) {
+        let heuristics = self.board.heuristics();
+        out.assign(&ArrayView1::from(&heuristics));
     }
 
     fn apply_action(&mut self, action: Self::Action) -> Self::RollbackState {
@@ -102,7 +106,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-
 
     #[test]
     fn test_action_trait() {

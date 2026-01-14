@@ -1323,9 +1323,7 @@ mod tests {
             false,
         );
         let snapshot = board.clone();
-        let rollback = board
-            .apply_move(ByteFightAction::East)
-            .expect("valid move");
+        let rollback = board.apply_move(ByteFightAction::East).expect("valid move");
         board.rollback(rollback);
         assert_eq!(board, snapshot);
     }

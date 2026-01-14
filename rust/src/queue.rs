@@ -2,11 +2,17 @@
 //!
 //! Uses atomic fetch_add for slot assignment and batch completion tracking.
 //! Designed for 512 workers (32 threads x 16 workers) submitting to batches of 256.
+//!
+//! Observations are stored in a single contiguous array with shape (TOTAL_SLOTS, ...obs_shape).
+//! This enables zero-copy batch slicing for GPU dispatch.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use event_listener::Event;
+use ndarray::{Array, ArrayView, ArrayViewMut, Axis, Slice};
+
+use crate::BatchDim;
 
 /// Number of jobs per batch. In production this would be 256.
 /// Using a smaller value for tests to avoid deadlock with few workers.
@@ -20,10 +26,14 @@ pub const TOTAL_SLOTS: usize = BATCH_SIZE * NUM_BATCHES;
 
 /// A lock-free queue for batching GPU inference jobs.
 ///
-/// Workers submit inputs and receive tickets. When a batch fills (256 jobs),
-/// the completing worker triggers GPU dispatch. Workers poll for results
-/// using their tickets.
-pub struct GpuJobQueue<I, O> {
+/// Workers submit observations via callback and receive tickets. When a batch fills,
+/// the completing worker triggers GPU dispatch with a zero-copy view of the batch.
+pub struct GpuJobQueue<A, D, O>
+where
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    O: Copy + Default + Send + Sync,
+{
     /// Monotonically increasing counter for slot assignment.
     write_ticket: AtomicU64,
     /// Count of completed writes per batch slot.
@@ -34,9 +44,9 @@ pub struct GpuJobQueue<I, O> {
     /// Workers check this to know if their result is ready.
     batch_complete: [AtomicU64; NUM_BATCHES],
 
-    /// Input buffer. Size = TOTAL_SLOTS.
-    /// UnsafeCell because multiple threads write to different slots concurrently.
-    inputs: Box<[UnsafeCell<I>]>,
+    /// Observation storage: shape is (TOTAL_SLOTS, ...obs_shape).
+    /// Single contiguous allocation for zero-copy batch slicing.
+    observations: UnsafeCell<Array<A, D::BatchedDim>>,
 
     /// Output buffer. Size = TOTAL_SLOTS.
     outputs: Box<[UnsafeCell<O>]>,
@@ -45,35 +55,49 @@ pub struct GpuJobQueue<I, O> {
     completion_event: Event,
 
     /// Callback invoked when a batch is ready.
-    /// Receives (inputs slice, outputs slice) and should fill outputs.
-    dispatch: Box<dyn Fn(&[I], &mut [O]) + Send + Sync>,
+    /// Receives a view of the batch observations and should fill outputs.
+    dispatch: Box<dyn Fn(ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync>,
 }
 
 // SAFETY: The queue is designed for concurrent access:
 // - write_ticket ensures each slot is claimed by exactly one writer
 // - batch_writes/batch_complete use atomic operations
-// - inputs/outputs slots are only written by their ticket owner, read after batch_complete
+// - observation slots are only written by their ticket owner, read after batch_complete
 // - dispatch is Send + Sync
-unsafe impl<I: Send, O: Send> Send for GpuJobQueue<I, O> {}
-unsafe impl<I: Send + Sync, O: Send + Sync> Sync for GpuJobQueue<I, O> {}
-
-impl<I, O> GpuJobQueue<I, O>
+unsafe impl<A, D, O> Send for GpuJobQueue<A, D, O>
 where
-    I: Copy + Default,
-    O: Copy + Default,
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    O: Copy + Default + Send + Sync,
 {
-    /// Creates a new job queue with the given dispatch callback.
+}
+unsafe impl<A, D, O> Sync for GpuJobQueue<A, D, O>
+where
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    O: Copy + Default + Send + Sync,
+{
+}
+
+impl<A, D, O> GpuJobQueue<A, D, O>
+where
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    O: Copy + Default + Send + Sync,
+{
+    /// Creates a new job queue with the given observation shape and dispatch callback.
     ///
     /// The callback is invoked when a batch of BATCH_SIZE jobs is ready.
-    /// It receives input and output slices and should fill the outputs.
-    pub fn new<F>(dispatch: F) -> Self
+    /// It receives a view of the batch observations (shape: BATCH_SIZE x obs_shape)
+    /// and should fill the outputs.
+    pub fn new<F>(obs_shape: D, dispatch: F) -> Self
     where
-        F: Fn(&[I], &mut [O]) + Send + Sync + 'static,
+        F: Fn(ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync + 'static,
     {
-        // Initialize input/output buffers
-        let inputs: Box<[UnsafeCell<I>]> = (0..TOTAL_SLOTS)
-            .map(|_| UnsafeCell::new(I::default()))
-            .collect();
+        // Build the batched shape: (TOTAL_SLOTS, ...obs_shape)
+        let full_shape = D::with_batch(TOTAL_SLOTS, obs_shape);
+        let observations = Array::default(full_shape);
+
         let outputs: Box<[UnsafeCell<O>]> = (0..TOTAL_SLOTS)
             .map(|_| UnsafeCell::new(O::default()))
             .collect();
@@ -82,33 +106,37 @@ where
             write_ticket: AtomicU64::new(0),
             batch_writes: std::array::from_fn(|_| AtomicU64::new(0)),
             batch_complete: std::array::from_fn(|_| AtomicU64::new(0)),
-            inputs,
+            observations: UnsafeCell::new(observations),
             outputs,
             completion_event: Event::new(),
             dispatch: Box::new(dispatch),
         }
     }
 
-    /// Submit a job and return a ticket for polling the result.
+    /// Submit a job by writing an observation via callback.
+    ///
+    /// The callback receives a mutable view into the queue's contiguous storage
+    /// for zero-copy observation writing.
     ///
     /// If this submission completes a batch, the current thread will
     /// synchronously dispatch the batch (blocking until complete).
-    pub fn submit(&self, input: I) -> u64 {
+    pub fn submit<F>(&self, write_obs: F) -> u64
+    where
+        F: FnOnce(ArrayViewMut<A, D>),
+    {
         // Claim a slot
         let ticket = self.write_ticket.fetch_add(1, Ordering::Relaxed);
         let slot_idx = (ticket as usize) % TOTAL_SLOTS;
         let batch_idx = ((ticket as usize) / BATCH_SIZE) % NUM_BATCHES;
 
-        // Write input to our slot
+        // Get mutable view of our slot and let caller write the observation
         // SAFETY: We own this slot exclusively until we increment batch_writes
-        unsafe {
-            *self.inputs[slot_idx].get() = input;
-        }
+        // index_axis_mut on Array<A, D::BatchedDim> returns ArrayViewMut<A, D>
+        // because D::BatchedDim::Smaller == D (guaranteed by BatchDim trait)
+        let slot_view = unsafe { (*self.observations.get()).index_axis_mut(Axis(0), slot_idx) };
+        write_obs(slot_view);
 
-        // Release fence ensures the write is visible before we signal completion
-        std::sync::atomic::fence(Ordering::Release);
-
-        // Signal that our write is complete
+        // AcqRel: Release our write, Acquire if we trigger dispatch to see others' writes
         let writes_in_batch = self.batch_writes[batch_idx].fetch_add(1, Ordering::AcqRel) + 1;
 
         // If we completed the batch, dispatch it
@@ -121,27 +149,30 @@ where
 
     /// Dispatch a completed batch to the GPU.
     fn dispatch_batch(&self, batch_idx: usize, trigger_ticket: u64) {
-        let batch_start_slot = batch_idx * BATCH_SIZE;
+        let batch_start = batch_idx * BATCH_SIZE;
 
+        // Zero-copy slice of the batch observations
         // SAFETY: All writes to this batch are complete (batch_writes == BATCH_SIZE)
-        let inputs: Vec<I> = (batch_start_slot..batch_start_slot + BATCH_SIZE)
-            .map(|i| unsafe { *self.inputs[i].get() })
-            .collect();
+        let obs_array = unsafe { &*self.observations.get() };
+        let batch_view =
+            obs_array.slice_axis(Axis(0), Slice::from(batch_start..batch_start + BATCH_SIZE));
+        debug_assert!(
+            batch_view.is_standard_layout(),
+            "batch_view should be contiguous for efficient GPU transfer"
+        );
 
         let mut outputs: Vec<O> = vec![O::default(); BATCH_SIZE];
 
-        (self.dispatch)(&inputs, &mut outputs);
+        (self.dispatch)(batch_view, &mut outputs);
 
         // SAFETY: We're the only one writing outputs for this batch
         for (i, output) in outputs.into_iter().enumerate() {
             unsafe {
-                *self.outputs[batch_start_slot + i].get() = output;
+                *self.outputs[batch_start + i].get() = output;
             }
         }
 
         // Calculate the batch end ticket (first ticket of next batch)
-        // trigger_ticket is somewhere in [batch_start, batch_end)
-        // batch_end_ticket = (batch_number + 1) * BATCH_SIZE
         let batch_number = trigger_ticket / BATCH_SIZE as u64;
         let batch_end_ticket = (batch_number + 1) * BATCH_SIZE as u64;
 
@@ -186,19 +217,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Ix0;
     use std::sync::Arc;
 
     #[test]
     fn test_single_batch_completion() {
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            // Simple transform: output = input * 2
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input * 2;
-            }
-        }));
+        // Use Ix0 (scalar) for simple tests
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                // Simple transform: output = input * 2
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = input * 2;
+                }
+            }));
 
         // Submit BATCH_SIZE jobs
-        let tickets: Vec<u64> = (0..BATCH_SIZE as u64).map(|i| queue.submit(i)).collect();
+        let tickets: Vec<u64> = (0..BATCH_SIZE as u64)
+            .map(|i| queue.submit(|mut out| out[()] = i))
+            .collect();
 
         // All should be complete now (last submit triggered dispatch)
         for (i, &ticket) in tickets.iter().enumerate() {
@@ -210,15 +246,16 @@ mod tests {
 
     #[test]
     fn test_partial_batch_not_ready() {
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input * 2;
-            }
-        }));
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = input * 2;
+                }
+            }));
 
         // Submit less than a full batch
         let tickets: Vec<u64> = (0..BATCH_SIZE as u64 - 1)
-            .map(|i| queue.submit(i))
+            .map(|i| queue.submit(|mut out| out[()] = i))
             .collect();
 
         // None should be ready
@@ -230,7 +267,7 @@ mod tests {
         }
 
         // Complete the batch
-        queue.submit(BATCH_SIZE as u64 - 1);
+        queue.submit(|mut out| out[()] = BATCH_SIZE as u64 - 1);
 
         // Now all should be ready
         for &ticket in &tickets {
@@ -243,15 +280,16 @@ mod tests {
 
     #[test]
     fn test_multiple_batches() {
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input + 1000;
-            }
-        }));
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = input + 1000;
+                }
+            }));
 
         // Submit 3 full batches
         let all_tickets: Vec<u64> = (0..(BATCH_SIZE * 3) as u64)
-            .map(|i| queue.submit(i))
+            .map(|i| queue.submit(|mut out| out[()] = i))
             .collect();
 
         // All should be ready
@@ -263,18 +301,17 @@ mod tests {
 
     #[test]
     fn test_batch_slot_reuse() {
-        // This test verifies that batch slots can be reused correctly.
-        // Key invariant: a slot can't be resubmitted until its owner reads the result.
-        // With TOTAL_SLOTS = 2048 and submitting in batches, we need to read results
-        // before we can wrap around and reuse slots.
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input;
-            }
-        }));
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = *input;
+                }
+            }));
 
         // Submit exactly NUM_BATCHES batches (fills all slots)
-        let tickets_round1: Vec<u64> = (0..TOTAL_SLOTS as u64).map(|i| queue.submit(i)).collect();
+        let tickets_round1: Vec<u64> = (0..TOTAL_SLOTS as u64)
+            .map(|i| queue.submit(|mut out| out[()] = i))
+            .collect();
 
         // Read all results from round 1
         for (i, &ticket) in tickets_round1.iter().enumerate() {
@@ -288,7 +325,7 @@ mod tests {
 
         // Now submit another round (reusing slots)
         let tickets_round2: Vec<u64> = (TOTAL_SLOTS as u64..(TOTAL_SLOTS * 2) as u64)
-            .map(|i| queue.submit(i))
+            .map(|i| queue.submit(|mut out| out[()] = i))
             .collect();
 
         // Read all results from round 2
@@ -308,11 +345,12 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
-        let queue: Arc<GpuJobQueue<u64, u64>> = Arc::new(GpuJobQueue::new(|inputs, outputs| {
-            for (i, &input) in inputs.iter().enumerate() {
-                outputs[i] = input * 2;
-            }
-        }));
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
+            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = input * 2;
+                }
+            }));
 
         let batch_count = Arc::new(AtomicUsize::new(0));
         let num_threads = 4;
@@ -327,8 +365,9 @@ mod tests {
                     let mut results = Vec::new();
 
                     for i in 0..jobs_per_thread as u64 {
-                        let ticket = queue.submit(base + i);
-                        results.push((ticket, base + i));
+                        let val = base + i;
+                        let ticket = queue.submit(|mut out| out[()] = val);
+                        results.push((ticket, val));
                     }
 
                     // Wait for results

@@ -2,8 +2,10 @@
 
 use std::future::Future;
 
+use ndarray::Dimension;
+
 use crate::queue::GpuJobQueue;
-use crate::Environment;
+use crate::{BatchDim, Environment};
 
 /// Output from neural network evaluation: (policy logits, value).
 /// Policy has one entry per possible action, value is in [-1, 1].
@@ -33,16 +35,21 @@ pub trait Evaluator<E: Environment> {
 ///
 /// Wraps a GpuJobQueue and converts between Environment observations
 /// and the queue's I/O types.
-pub struct GpuEvaluator<'a, E: Environment, const NUM_ACTIONS: usize> {
-    queue: &'a GpuJobQueue<E::Observation, PolicyValue<NUM_ACTIONS>>,
+pub struct GpuEvaluator<'a, E: Environment, const NUM_ACTIONS: usize>
+where
+    E::ObsDim: BatchDim,
+    <E::ObsDim as Dimension>::Larger: Dimension,
+{
+    queue: &'a GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>,
 }
 
 impl<'a, E, const NUM_ACTIONS: usize> GpuEvaluator<'a, E, NUM_ACTIONS>
 where
     E: Environment,
-    E::Observation: Copy + Default,
+    E::ObsDim: BatchDim,
+    <E::ObsDim as Dimension>::Larger: Dimension,
 {
-    pub fn new(queue: &'a GpuJobQueue<E::Observation, PolicyValue<NUM_ACTIONS>>) -> Self {
+    pub fn new(queue: &'a GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>) -> Self {
         Self { queue }
     }
 }
@@ -50,11 +57,14 @@ where
 impl<'a, E, const NUM_ACTIONS: usize> Evaluator<E> for GpuEvaluator<'a, E, NUM_ACTIONS>
 where
     E: Environment,
-    E::Observation: Copy + Default,
+    E::ObsDim: BatchDim,
+    <E::ObsDim as Dimension>::Larger: Dimension,
 {
     fn evaluate(&self, env: &E) -> impl Future<Output = (Vec<f32>, f32)> {
-        let obs = env.observation();
-        let future = self.queue.eval(obs);
+        // Submit immediately with callback that writes observation
+        let future = self.queue.eval(|out| {
+            env.observation(out);
+        });
 
         async move {
             let result = future.await;
@@ -113,6 +123,9 @@ where
 mod tests {
     use super::*;
     use crate::environments::TicTacToe;
+    use crate::queue::BATCH_SIZE;
+    use ndarray::Ix1;
+    use std::sync::Arc;
 
     #[test]
     fn test_uniform_evaluator() {
@@ -185,13 +198,15 @@ mod tests {
 
     #[test]
     fn test_gpu_evaluator() {
-        use crate::queue::BATCH_SIZE;
-        use std::sync::Arc;
+        use crate::executor::Executor;
+        use std::cell::Cell;
+        use std::rc::Rc;
 
         // Create a mock GPU queue that returns uniform policy
         type Output = PolicyValue<{ TicTacToe::NUM_ACTIONS }>;
-        let queue: Arc<GpuJobQueue<[u8; 9], Output>> = Arc::new(GpuJobQueue::new(
-            |_inputs: &[[u8; 9]], outputs: &mut [Output]| {
+        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+            TicTacToe::OBS_SHAPE,
+            |_inputs, outputs: &mut [Output]| {
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
                     output.value = 0.0;
@@ -199,15 +214,10 @@ mod tests {
             },
         ));
 
-        let evaluator = GpuEvaluator::new(&*queue);
+        let evaluator = GpuEvaluator::<TicTacToe, { TicTacToe::NUM_ACTIONS }>::new(&*queue);
 
         // Submit BATCH_SIZE evaluations to trigger dispatch
         let envs: Vec<TicTacToe> = (0..BATCH_SIZE).map(|_| TicTacToe::new()).collect();
-
-        // Use the executor to run the futures
-        use crate::executor::Executor;
-        use std::cell::Cell;
-        use std::rc::Rc;
 
         let results: Rc<Cell<usize>> = Rc::new(Cell::new(0));
 

@@ -1,3 +1,5 @@
+use ndarray::{ArrayView1, ArrayViewMut, Ix1};
+
 use crate::{Action, Environment, Player, TerminalState};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -55,10 +57,12 @@ pub struct TicTacToeRollback {
 }
 
 impl Environment for TicTacToe {
-    type Observation = [u8; 9];
+    type ObsElem = u8;
+    type ObsDim = Ix1;
     type Action = TicTacToeAction;
     type RollbackState = TicTacToeRollback;
     const NUM_ACTIONS: usize = 9;
+    const OBS_SHAPE: Ix1 = Ix1(9);
 
     fn new() -> Self {
         TicTacToe {
@@ -90,8 +94,8 @@ impl Environment for TicTacToe {
         self.current_player
     }
 
-    fn observation(&self) -> Self::Observation {
-        self.board
+    fn observation(&self, mut out: ArrayViewMut<u8, Ix1>) {
+        out.assign(&ArrayView1::from(&self.board));
     }
 
     fn apply_action(&mut self, action: Self::Action) -> Self::RollbackState {
