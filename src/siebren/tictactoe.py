@@ -1,0 +1,49 @@
+from typing import Callable, Tuple
+
+import numpy as np
+import numpy.typing as npt
+
+from . import siebren
+
+
+class TicTacToeSelfPlay:
+    """Self-play runner for TicTacToe.
+
+    IMPORTANT: num_threads * workers_per_thread must be >= 256 (the batch size).
+    Workers submit observations to a shared queue that dispatches when full.
+    With fewer workers than batch size, workers will deadlock waiting for a
+    batch that can never fill. Default config (32 * 16 = 512) is safe.
+
+    The execute_model callback:
+    - Input: (256, 9) int8 array - board states (0=empty, 1=X, -1=O)
+    - Output: tuple of (policy, value)
+        - policy: (256, 9) float32 - action probabilities
+        - value: (256,) float32 - position evaluations in [-1, 1]
+    """
+
+    def __init__(
+        self,
+        num_threads: int = 32,
+        workers_per_thread: int = 16,
+        seed: int = 42,
+    ) -> None:
+        self.num_threads = num_threads
+        self.workers_per_thread = workers_per_thread
+        self.seed = seed
+
+    def play_games(
+        self,
+        num_games: int,
+        execute_model: Callable[
+            [npt.NDArray[np.int8]],
+            Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
+        ],
+    ) -> int:
+        """Run self-play games and return number completed."""
+        return siebren.selfplay_tictactoe(
+            self.num_threads,
+            self.workers_per_thread,
+            num_games,
+            self.seed,
+            execute_model,
+        )

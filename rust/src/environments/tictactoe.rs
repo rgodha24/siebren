@@ -17,7 +17,8 @@ impl Action for TicTacToeAction {
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub struct TicTacToe {
-    pub board: [u8; 9], // 0 = empty, 1 = PlayerA (X), 2 = PlayerB (O)
+    /// Board state: 0 = empty, 1 = PlayerA (X), -1 = PlayerB (O)
+    pub board: [i8; 9],
     current_player: Player,
     move_count: u8,
 }
@@ -57,7 +58,7 @@ pub struct TicTacToeRollback {
 }
 
 impl Environment for TicTacToe {
-    type ObsElem = u8;
+    type ObsElem = i8;
     type ObsDim = Ix1;
     type Action = TicTacToeAction;
     type RollbackState = TicTacToeRollback;
@@ -94,7 +95,7 @@ impl Environment for TicTacToe {
         self.current_player
     }
 
-    fn observation(&self, mut out: ArrayViewMut<u8, Ix1>) {
+    fn observation(&self, mut out: ArrayViewMut<i8, Ix1>) {
         out.assign(&ArrayView1::from(&self.board));
     }
 
@@ -102,10 +103,8 @@ impl Environment for TicTacToe {
         let cell = action.0;
         let previous_player = self.current_player;
 
-        self.board[cell as usize] = match self.current_player {
-            Player::PlayerA => 1,
-            Player::PlayerB => 2,
-        };
+        // 1 = PlayerA, -1 = PlayerB
+        self.board[cell as usize] = self.current_player as i8;
         self.current_player = match self.current_player {
             Player::PlayerA => Player::PlayerB,
             Player::PlayerB => Player::PlayerA,
@@ -152,7 +151,7 @@ mod tests {
         let mut game = TicTacToe::new();
 
         let rollback = game.apply_action(TicTacToeAction(4));
-        assert_eq!(game.board[4], 1);
+        assert_eq!(game.board[4], 1); // PlayerA = 1
         assert_eq!(game.current_player(), Player::PlayerB);
         assert_eq!(game.valid_actions().count(), 8);
 
@@ -160,6 +159,17 @@ mod tests {
         assert_eq!(game.board[4], 0);
         assert_eq!(game.current_player(), Player::PlayerA);
         assert_eq!(game.valid_actions().count(), 9);
+    }
+
+    #[test]
+    fn test_player_b_moves() {
+        let mut game = TicTacToe::new();
+
+        game.apply_action(TicTacToeAction(0)); // PlayerA
+        game.apply_action(TicTacToeAction(4)); // PlayerB
+
+        assert_eq!(game.board[0], 1);  // PlayerA = 1
+        assert_eq!(game.board[4], -1); // PlayerB = -1
     }
 
     #[test]

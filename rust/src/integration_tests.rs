@@ -27,7 +27,7 @@ mod tests {
         let dispatch_count_clone = dispatch_count.clone();
 
         type Output = PolicyValue<9>;
-        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+        let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
@@ -77,7 +77,7 @@ mod tests {
         let dispatch_count_clone = dispatch_count.clone();
 
         type Output = PolicyValue<9>;
-        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+        let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
@@ -126,7 +126,7 @@ mod tests {
         let dispatch_count_clone = dispatch_count.clone();
 
         type Output = PolicyValue<9>;
-        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+        let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);

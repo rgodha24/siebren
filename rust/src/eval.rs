@@ -204,7 +204,7 @@ mod tests {
 
         // Create a mock GPU queue that returns uniform policy
         type Output = PolicyValue<{ TicTacToe::NUM_ACTIONS }>;
-        let queue: Arc<GpuJobQueue<u8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
+        let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             |_inputs, outputs: &mut [Output]| {
                 for output in outputs.iter_mut() {

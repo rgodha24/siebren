@@ -1,4 +1,5 @@
-use ndarray::{ArrayViewMut, Dimension, Ix0, Ix1, Ix2, Ix3, Ix4, Ix5, Ix6, RemoveAxis};
+use ndarray::{ArrayView, ArrayViewMut, Dimension, Ix0, Ix1, Ix2, Ix3, Ix4, Ix5, Ix6, RemoveAxis};
+use numpy::{PyArray, PyArrayMethods};
 use pyo3::prelude::*;
 use std::{fmt::Debug, hash::Hash};
 
@@ -71,14 +72,80 @@ pub mod queue;
 pub mod training;
 pub mod worker;
 
+/// Run TicTacToe self-play with Python model callback.
+///
+/// The callback receives observations as a (BATCH_SIZE, 9) int8 numpy array.
+/// Board encoding: 0 = empty, 1 = PlayerA (X), -1 = PlayerB (O)
+///
+/// Returns (policy, value) tuple where:
+/// - policy: (BATCH_SIZE, 9) float32 - action probabilities
+/// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
+#[pyo3(signature = (num_threads, workers_per_thread, total_games, seed, execute_model))]
+fn selfplay_tictactoe(
+    py: Python<'_>,
+    num_threads: usize,
+    workers_per_thread: usize,
+    total_games: usize,
+    seed: u64,
+    execute_model: Py<PyAny>,
+) -> PyResult<usize> {
+    use environments::TicTacToe;
+    use eval::PolicyValue;
+    use training::{run_training, TrainingConfig};
+    use worker::WorkerConfig;
+
+    let config = TrainingConfig {
+        num_threads,
+        workers_per_thread,
+        seed,
+        total_games,
+        worker: WorkerConfig::default(),
+    };
+
+    let dispatch = move |obs_view: ArrayView<i8, Ix2>, outputs: &mut [PolicyValue<9>]| {
+        Python::attach(|py| {
+            // Zero-copy numpy array from obs_view
+            // SAFETY: obs_view is valid for the duration of this callback,
+            // and the numpy array doesn't escape the callback scope.
+            let np_obs = unsafe {
+                PyArray::borrow_from_array(&obs_view, py.None().into_bound(py))
+            };
+
+            // Call Python: (BATCH_SIZE, 9) -> ((BATCH_SIZE, 9), (BATCH_SIZE,))
+            let result = execute_model
+                .call1(py, (np_obs,))
+                .expect("execute_model call failed");
+
+            let (policy_arr, value_arr): (
+                Bound<'_, PyArray<f32, Ix2>>,
+                Bound<'_, PyArray<f32, Ix1>>,
+            ) = result
+                .extract(py)
+                .expect("expected (policy, value) tuple of numpy arrays");
+
+            // Copy results back to PolicyValue outputs
+            let policy = unsafe { policy_arr.as_slice().unwrap() };
+            let value = unsafe { value_arr.as_slice().unwrap() };
+
+            for (i, out) in outputs.iter_mut().enumerate() {
+                out.policy.copy_from_slice(&policy[i * 9..(i + 1) * 9]);
+                out.value = value[i];
+            }
+        });
+    };
+
+    // Release GIL while running training, reacquire in dispatch callback
+    let result = py.detach(|| run_training::<TicTacToe, 9, _>(config, dispatch));
+
+    // TODO: Add result.samples to reservoir
+
+    Ok(result.games_completed)
 }
 
 #[pymodule]
 fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
+    m.add_function(wrap_pyfunction!(selfplay_tictactoe, m)?)?;
     Ok(())
 }
 
