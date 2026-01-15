@@ -6,8 +6,8 @@ import numpy.typing as npt
 from . import siebren
 
 
-class TicTacToeSelfPlay:
-    """Self-play runner for TicTacToe.
+class Connect4SelfPlay:
+    """Self-play runner for Connect4.
 
     IMPORTANT: num_threads * workers_per_thread must be >= 256 (the batch size).
     Workers submit observations to a shared queue that dispatches when full.
@@ -15,9 +15,10 @@ class TicTacToeSelfPlay:
     batch that can never fill. Default config (32 * 16 = 512) is safe.
 
     The execute_model callback:
-    - Input: (256, 9) int8 array - board states (0=empty, 1=X, -1=O)
+    - Input: (256, 6, 7) int8 array - board states (0=empty, 1=PlayerA, -1=PlayerB)
+      Row 0 is top, row 5 is bottom. Pieces fall down.
     - Output: tuple of (policy, value)
-        - policy: (256, 9) float32 - action probabilities
+        - policy: (256, 7) float32 - action probabilities for each column
         - value: (256,) float32 - position evaluations in [-1, 1]
     """
 
@@ -45,7 +46,7 @@ class TicTacToeSelfPlay:
         ],
     ) -> int:
         """Run self-play games and return number completed."""
-        return siebren.selfplay_tictactoe(
+        return siebren.selfplay_connect4(
             self.num_threads,
             self.workers_per_thread,
             num_games,

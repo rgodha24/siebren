@@ -1,5 +1,6 @@
 from .siebren import *
 from .tictactoe import TicTacToeSelfPlay
+from .connect4 import Connect4SelfPlay
 
 __doc__ = siebren.__doc__  # type: ignore[name-defined]
 if hasattr(siebren, "__all__"):  # type: ignore[name-defined]

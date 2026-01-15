@@ -143,9 +143,81 @@ fn selfplay_tictactoe(
     Ok(result.games_completed)
 }
 
+/// Run Connect4 self-play with Python model callback.
+///
+/// The callback receives observations as a (BATCH_SIZE, 6, 7) int8 numpy array.
+/// Board encoding: 0 = empty, 1 = PlayerA, -1 = PlayerB
+/// Row 0 is top, row 5 is bottom. Pieces fall down.
+///
+/// Returns (policy, value) tuple where:
+/// - policy: (BATCH_SIZE, 7) float32 - action probabilities for each column
+/// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
+#[pyfunction]
+#[pyo3(signature = (num_threads, workers_per_thread, total_games, seed, execute_model))]
+fn selfplay_connect4(
+    py: Python<'_>,
+    num_threads: usize,
+    workers_per_thread: usize,
+    total_games: usize,
+    seed: u64,
+    execute_model: Py<PyAny>,
+) -> PyResult<usize> {
+    use environments::Connect4;
+    use eval::PolicyValue;
+    use training::{run_training, TrainingConfig};
+    use worker::WorkerConfig;
+
+    let config = TrainingConfig {
+        num_threads,
+        workers_per_thread,
+        seed,
+        total_games,
+        worker: WorkerConfig::default(),
+    };
+
+    let dispatch = move |obs_view: ArrayView<i8, Ix3>, outputs: &mut [PolicyValue<7>]| {
+        Python::attach(|py| {
+            // Zero-copy numpy array from obs_view
+            // SAFETY: obs_view is valid for the duration of this callback,
+            // and the numpy array doesn't escape the callback scope.
+            let np_obs =
+                unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
+
+            // Call Python: (BATCH_SIZE, 6, 7) -> ((BATCH_SIZE, 7), (BATCH_SIZE,))
+            let result = execute_model
+                .call1(py, (np_obs,))
+                .expect("execute_model call failed");
+
+            let (policy_arr, value_arr): (
+                Bound<'_, PyArray<f32, Ix2>>,
+                Bound<'_, PyArray<f32, Ix1>>,
+            ) = result
+                .extract(py)
+                .expect("expected (policy, value) tuple of numpy arrays");
+
+            // Copy results back to PolicyValue outputs
+            let policy = unsafe { policy_arr.as_slice().unwrap() };
+            let value = unsafe { value_arr.as_slice().unwrap() };
+
+            for (i, out) in outputs.iter_mut().enumerate() {
+                out.policy.copy_from_slice(&policy[i * 7..(i + 1) * 7]);
+                out.value = value[i];
+            }
+        });
+    };
+
+    // Release GIL while running training, reacquire in dispatch callback
+    let result = py.detach(|| run_training::<Connect4, 7, _>(config, dispatch));
+
+    // TODO: Add result.samples to reservoir
+
+    Ok(result.games_completed)
+}
+
 #[pymodule]
 fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(selfplay_tictactoe, m)?)?;
+    m.add_function(wrap_pyfunction!(selfplay_connect4, m)?)?;
     Ok(())
 }
 
