@@ -1,9 +1,12 @@
-from typing import Callable, Tuple
+from typing import TYPE_CHECKING, Callable, Tuple
 
 import numpy as np
 import numpy.typing as npt
 
 from . import siebren
+
+if TYPE_CHECKING:
+    from .siebren import PyReplayBuffer
 
 
 class TicTacToeSelfPlay:
@@ -20,6 +23,8 @@ class TicTacToeSelfPlay:
         - policy: (256, 9) float32 - action probabilities
         - value: (256,) float32 - position evaluations in [-1, 1]
     """
+
+    NUM_ACTIONS = 9
 
     def __init__(
         self,
@@ -38,17 +43,19 @@ class TicTacToeSelfPlay:
 
     def play_games(
         self,
-        num_games: int,
+        replay_buffer: "PyReplayBuffer",
+        num_samples: int,
         execute_model: Callable[
             [npt.NDArray[np.int8]],
             Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
         ],
-    ) -> int:
-        """Run self-play games and return number completed."""
+    ) -> Tuple[int, int]:
+        """Run self-play games and return (games_completed, samples_collected)."""
         return siebren.selfplay_tictactoe(
+            replay_buffer,
             self.num_threads,
             self.workers_per_thread,
-            num_games,
+            num_samples,
             self.seed,
             execute_model,
         )

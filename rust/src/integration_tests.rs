@@ -238,7 +238,10 @@ mod tests {
         // We collect at least target_samples (may be slightly more due to race)
         assert!(collected_samples >= target_samples);
         // TicTacToe games are 5-9 moves, so ~22-40 games for 200 samples
-        assert!(completed_games >= 20, "expected at least 20 games, got {completed_games}");
+        assert!(
+            completed_games >= 20,
+            "expected at least 20 games, got {completed_games}"
+        );
         assert_eq!(replay_buffer.len(), collected_samples);
     }
 
