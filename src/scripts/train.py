@@ -309,7 +309,7 @@ def train(config: TrainConfig):
     else:
         raise ValueError(f"Unknown game: {config.game}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    optimizer = torch.optim.Muon(model.parameters(), lr=config.lr)
     execute_model = make_execute_model(model, config.device, num_actions)
 
     # Setup checkpoint directory

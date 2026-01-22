@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Debug, hash::Hash};
 
@@ -78,7 +77,7 @@ pub mod replay_buffer;
 pub mod training;
 pub mod worker;
 
-use replay_buffer::{ReplayBuffer, Sample};
+use replay_buffer::ReplayBuffer;
 
 /// Python-accessible replay buffer for storing training samples.
 #[pyclass]
@@ -88,7 +87,6 @@ pub struct PyReplayBuffer {
 
 #[pymethods]
 impl PyReplayBuffer {
-    /// Create a new replay buffer with the given capacity.
     #[new]
     fn new(capacity: usize) -> Self {
         Self {
@@ -96,114 +94,17 @@ impl PyReplayBuffer {
         }
     }
 
-    /// Return the number of samples in the buffer.
     fn __len__(&self) -> usize {
         self.inner.len()
     }
 
-    /// Return the buffer capacity.
     #[getter]
     fn capacity(&self) -> usize {
         self.inner.capacity()
     }
-
-    /// Sample n items and convert to numpy arrays.
-    ///
-    /// Returns (notations, policies, values) where:
-    /// - notations: list of strings (game states in notation format)
-    /// - policies: (n, num_actions) float32 numpy array
-    /// - values: (n,) float32 numpy array
-    fn sample<'py>(
-        &self,
-        py: Python<'py>,
-        n: usize,
-        seed: u64,
-    ) -> PyResult<(
-        Vec<String>,
-        Bound<'py, PyArray<f32, Ix2>>,
-        Bound<'py, PyArray<f32, Ix1>>,
-    )> {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let samples = self.inner.sample(n, &mut rng);
-
-        if samples.is_empty() {
-            // Return empty arrays
-            let notations: Vec<String> = Vec::new();
-            let policies = PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, 0))?;
-            let values = PyArray::from_vec(py, Vec::new());
-            return Ok((notations, policies, values));
-        }
-
-        // Get policy length from first sample
-        let policy_len = samples[0].policy.len();
-        let num_samples = samples.len();
-
-        // Extract data
-        let notations: Vec<String> = samples.iter().map(|s| s.notation.clone()).collect();
-
-        // Flatten policies into contiguous array
-        let mut policy_data: Vec<f32> = Vec::with_capacity(num_samples * policy_len);
-        for sample in &samples {
-            policy_data.extend_from_slice(&sample.policy);
-        }
-
-        let values: Vec<f32> = samples.iter().map(|s| s.value).collect();
-
-        // Create numpy arrays
-        let policies = PyArray::from_vec(py, policy_data).reshape(Ix2(num_samples, policy_len))?;
-        let values = PyArray::from_vec(py, values);
-
-        Ok((notations, policies, values))
-    }
-
-    /// Sample n notation strings from the buffer.
-    ///
-    /// Useful for converting to observations in Python.
-    fn sample_notations(&self, n: usize, seed: u64) -> Vec<String> {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let samples = self.inner.sample(n, &mut rng);
-        samples.into_iter().map(|s| s.notation).collect()
-    }
-
-    /// Save the buffer to a binary file.
-    ///
-    /// Args:
-    ///     path: File path to save to
-    ///     max_notation_len: Maximum notation string length (default 64)
-    ///     policy_len: Number of policy values per sample (e.g., 9 for TicTacToe, 7 for Connect4)
-    #[pyo3(signature = (path, policy_len, max_notation_len=64))]
-    fn save(&self, path: &str, policy_len: usize, max_notation_len: usize) -> PyResult<()> {
-        self.inner
-            .save(Path::new(path), max_notation_len, policy_len)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-    }
-
-    /// Load samples from a binary file into the buffer.
-    ///
-    /// Returns the number of samples loaded.
-    fn load(&self, path: &str) -> PyResult<usize> {
-        self.inner
-            .load(Path::new(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-    }
-
-    /// Manually push a sample into the buffer.
-    ///
-    /// Useful for testing or loading data from other sources.
-    fn push(&self, notation: String, policy: Vec<f32>, value: f32) {
-        let sample = Sample {
-            notation,
-            policy,
-            value,
-        };
-        let idx = self.inner.reserve(1);
-        // SAFETY: We just reserved this slot exclusively
-        unsafe { self.inner.write(idx, sample) };
-    }
 }
 
 impl PyReplayBuffer {
-    /// Get the inner Arc<ReplayBuffer> for use in Rust code.
     pub fn inner(&self) -> &Arc<ReplayBuffer> {
         &self.inner
     }

@@ -74,3 +74,4 @@ docs/_build/
 rust/target/
 !rust/src/bin
 wandb/
+.opencode/

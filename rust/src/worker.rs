@@ -161,20 +161,12 @@ pub async fn worker_loop<E, V, R>(
         let num_samples = game_samples.len();
 
         // Push samples to replay buffer
-        let start = replay_buffer.reserve(num_samples);
-        for (i, sample) in game_samples.iter().enumerate() {
-            // SAFETY: We just reserved these slots exclusively via reserve()
-            unsafe {
-                replay_buffer.write(
-                    start + i as u64,
-                    Sample {
-                        notation: sample.env.to_notation(),
-                        policy: sample.policy.clone(),
-                        value: sample.value,
-                    },
-                );
-            }
-        }
+        let mut guard = replay_buffer.reserve(num_samples);
+        guard.extend(game_samples.iter().map(|s| Sample {
+            notation: s.env.to_notation(),
+            policy: s.policy.clone(),
+            value: s.value,
+        }));
 
         samples_collected.fetch_add(num_samples, Ordering::AcqRel);
         games_completed.fetch_add(1, Ordering::AcqRel);
