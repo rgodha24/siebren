@@ -12,4 +12,7 @@ else:
         "TicTacToeSelfPlay",
         "Connect4SelfPlay",
         "ByteFightSelfPlay",
+        "sample_tictactoe",
+        "sample_connect4",
+        "sample_bytefight",
     ]

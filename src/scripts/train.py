@@ -1,14 +1,15 @@
-"""AlphaZero-style training script for TicTacToe and Connect4.
+"""AlphaZero-style training script for TicTacToe, Connect4, and ByteFight.
 
 Usage:
     uv run python src/scripts/train.py --game tictactoe --epochs 100
     uv run python src/scripts/train.py --game connect4 --epochs 100
+    uv run python src/scripts/train.py --game bytefight --epochs 100
 """
 
 import argparse
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Callable, Dict, Tuple
 
 import numpy as np
 import torch
@@ -16,16 +17,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
-from siebren import Connect4SelfPlay, TicTacToeSelfPlay
+from siebren import (
+    ByteFightSelfPlay,
+    Connect4SelfPlay,
+    PyReplayBuffer,
+    TicTacToeSelfPlay,
+    sample_bytefight,
+    sample_connect4,
+    sample_tictactoe,
+)
 
 
 @dataclass
 class TrainConfig:
     game: str = "tictactoe"
     epochs: int = 100
-    games_per_epoch: int = 256
+    samples_per_epoch: int = 4096
     train_batch_size: int = 256
-    train_steps_per_epoch: int = 10
+    train_steps_per_epoch: int = 16
+    replay_buffer_capacity: int = 100_000
     lr: float = 1e-3
     num_threads: int = 32
     workers_per_thread: int = 16
@@ -141,7 +151,7 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
     def execute_model(
         obs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4
+        # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4, (256, 18) for ByteFight
         x = torch.from_numpy(obs).to(device)
         policy_logits, value = model(x)
 
@@ -154,6 +164,52 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
     return execute_model
 
 
+def train_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    replay_buffer: PyReplayBuffer,
+    sample_fn: Callable,
+    batch_size: int,
+    device: str,
+    step: int,
+) -> Dict[str, float]:
+    """One training step. Returns dict of losses."""
+    model.train()
+
+    # Sample from replay buffer (converts notations to observations in Rust)
+    obs, policies, values = sample_fn(replay_buffer, batch_size, step)
+
+    # Move to device
+    obs = torch.from_numpy(obs).to(device)
+    target_policies = torch.from_numpy(policies).to(device)
+    target_values = torch.from_numpy(values).to(device)
+
+    # Forward pass
+    pred_logits, pred_values = model(obs)
+
+    # Policy loss: cross-entropy with target distribution
+    # log_softmax for numerical stability
+    log_probs = F.log_softmax(pred_logits, dim=-1)
+    policy_loss = -(target_policies * log_probs).sum(dim=-1).mean()
+
+    # Value loss: MSE
+    value_loss = F.mse_loss(pred_values, target_values)
+
+    # Total loss
+    total_loss = policy_loss + value_loss
+
+    # Backward pass
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    return {
+        "policy_loss": policy_loss.item(),
+        "value_loss": value_loss.item(),
+        "total_loss": total_loss.item(),
+    }
+
+
 def train(config: TrainConfig):
     """Main training loop."""
     # Initialize wandb
@@ -163,7 +219,10 @@ def train(config: TrainConfig):
         name=f"{config.game}-{time.strftime('%Y%m%d-%H%M%S')}",
     )
 
-    # Setup model and optimizer
+    # Create replay buffer
+    replay_buffer = PyReplayBuffer(config.replay_buffer_capacity)
+
+    # Setup model, selfplay, and sampling function based on game
     if config.game == "tictactoe":
         model = TicTacToeNet().to(config.device)
         selfplay = TicTacToeSelfPlay(
@@ -172,6 +231,7 @@ def train(config: TrainConfig):
             seed=config.seed,
         )
         num_actions = 9
+        sample_fn = sample_tictactoe
     elif config.game == "connect4":
         model = Connect4Net().to(config.device)
         selfplay = Connect4SelfPlay(
@@ -180,15 +240,27 @@ def train(config: TrainConfig):
             seed=config.seed,
         )
         num_actions = 7
+        sample_fn = sample_connect4
+    elif config.game == "bytefight":
+        model = ByteFightNet().to(config.device)
+        selfplay = ByteFightSelfPlay(
+            num_threads=config.num_threads,
+            workers_per_thread=config.workers_per_thread,
+            seed=config.seed,
+        )
+        num_actions = 11
+        sample_fn = sample_bytefight
     else:
         raise ValueError(f"Unknown game: {config.game}")
 
-    optimizer = torch.optim.Muon(model.parameters(), lr=config.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
     execute_model = make_execute_model(model, config.device, num_actions)
 
     # Track metrics
     total_games = 0
+    total_samples = 0
     total_batches = 0
+    global_step = 0
 
     for epoch in range(config.epochs):
         epoch_start = time.time()
@@ -202,39 +274,79 @@ def train(config: TrainConfig):
             return execute_model(obs)
 
         selfplay_start = time.time()
-        games_completed = selfplay.play_games(
-            num_games=config.games_per_epoch,
+        games_completed, samples_collected = selfplay.play_games(
+            replay_buffer=replay_buffer,
+            num_samples=config.samples_per_epoch,
             execute_model=counting_execute_model,
         )
         selfplay_time = time.time() - selfplay_start
 
         total_games += games_completed
+        total_samples += samples_collected
         total_batches += batch_count[0]
 
         # Log self-play metrics
-        wandb.log(
-            {
-                "epoch": epoch,
-                "selfplay/games_completed": games_completed,
-                "selfplay/batches": batch_count[0],
-                "selfplay/time_sec": selfplay_time,
-                "selfplay/games_per_sec": games_completed / selfplay_time,
-                "selfplay/batches_per_sec": batch_count[0] / selfplay_time,
-                "total/games": total_games,
-                "total/batches": total_batches,
+        selfplay_metrics = {
+            "epoch": epoch,
+            "selfplay/games_completed": games_completed,
+            "selfplay/samples_collected": samples_collected,
+            "selfplay/batches": batch_count[0],
+            "selfplay/time_sec": selfplay_time,
+            "selfplay/games_per_sec": games_completed / selfplay_time,
+            "selfplay/samples_per_sec": samples_collected / selfplay_time,
+            "selfplay/batches_per_sec": batch_count[0] / selfplay_time,
+            "total/games": total_games,
+            "total/samples": total_samples,
+            "total/batches": total_batches,
+            "replay_buffer/size": len(replay_buffer),
+        }
+        wandb.log(selfplay_metrics, step=global_step)
+
+        # Training phase
+        if len(replay_buffer) >= config.train_batch_size:
+            model.train()
+            train_start = time.time()
+
+            epoch_policy_loss = 0.0
+            epoch_value_loss = 0.0
+            epoch_total_loss = 0.0
+
+            for step in range(config.train_steps_per_epoch):
+                losses = train_step(
+                    model,
+                    optimizer,
+                    replay_buffer,
+                    sample_fn,
+                    config.train_batch_size,
+                    config.device,
+                    global_step + step,
+                )
+                epoch_policy_loss += losses["policy_loss"]
+                epoch_value_loss += losses["value_loss"]
+                epoch_total_loss += losses["total_loss"]
+
+            train_time = time.time() - train_start
+            num_steps = config.train_steps_per_epoch
+
+            # Log training metrics
+            train_metrics = {
+                "train/policy_loss": epoch_policy_loss / num_steps,
+                "train/value_loss": epoch_value_loss / num_steps,
+                "train/total_loss": epoch_total_loss / num_steps,
+                "train/time_sec": train_time,
+                "train/steps_per_sec": num_steps / train_time,
             }
-        )
+            wandb.log(train_metrics, step=global_step)
 
-        # Training phase (placeholder - we don't have samples returned yet)
-        # TODO: Once samples are returned from Rust, add training loop here
-        # model.train()
-        # for step in range(config.train_steps_per_epoch):
-        #     ...
-
+        global_step += 1
         epoch_time = time.time() - epoch_start
+
+        # Print progress
+        buffer_pct = 100 * len(replay_buffer) / config.replay_buffer_capacity
         print(
-            f"Epoch {epoch}: {games_completed} games, "
-            f"{batch_count[0]} batches, {epoch_time:.1f}s"
+            f"Epoch {epoch}: {games_completed} games, {samples_collected} samples, "
+            f"buffer {len(replay_buffer)}/{config.replay_buffer_capacity} ({buffer_pct:.1f}%), "
+            f"{epoch_time:.1f}s"
         )
 
     wandb.finish()
@@ -246,12 +358,30 @@ def main():
         "--game",
         type=str,
         default="tictactoe",
-        choices=["tictactoe", "connect4"],
+        choices=["tictactoe", "connect4", "bytefight"],
         help="Game to train on",
     )
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument(
-        "--games-per-epoch", type=int, default=256, help="Games per epoch"
+        "--samples-per-epoch",
+        type=int,
+        default=4096,
+        help="Target samples to collect per epoch",
+    )
+    parser.add_argument(
+        "--train-batch-size", type=int, default=256, help="Training batch size"
+    )
+    parser.add_argument(
+        "--train-steps-per-epoch",
+        type=int,
+        default=16,
+        help="Training steps per epoch",
+    )
+    parser.add_argument(
+        "--replay-buffer-capacity",
+        type=int,
+        default=100_000,
+        help="Replay buffer capacity",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument(
@@ -276,7 +406,10 @@ def main():
     config = TrainConfig(
         game=args.game,
         epochs=args.epochs,
-        games_per_epoch=args.games_per_epoch,
+        samples_per_epoch=args.samples_per_epoch,
+        train_batch_size=args.train_batch_size,
+        train_steps_per_epoch=args.train_steps_per_epoch,
+        replay_buffer_capacity=args.replay_buffer_capacity,
         lr=args.lr,
         num_threads=args.num_threads,
         workers_per_thread=args.workers_per_thread,

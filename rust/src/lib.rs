@@ -209,6 +209,182 @@ impl PyReplayBuffer {
     }
 }
 
+/// Sample from replay buffer and convert notations to observations for TicTacToe.
+///
+/// Returns (observations, policies, values) as numpy arrays:
+/// - observations: (n, 9) int8 array
+/// - policies: (n, 9) float32 array
+/// - values: (n,) float32 array
+#[pyfunction]
+fn sample_tictactoe<'py>(
+    py: Python<'py>,
+    replay_buffer: &PyReplayBuffer,
+    n: usize,
+    seed: u64,
+) -> PyResult<(
+    Bound<'py, PyArray<i8, Ix2>>,
+    Bound<'py, PyArray<f32, Ix2>>,
+    Bound<'py, PyArray<f32, Ix1>>,
+)> {
+    use environments::TicTacToe;
+    use rayon::prelude::*;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let samples = replay_buffer.inner.sample(n, &mut rng);
+
+    if samples.is_empty() {
+        let obs = PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, 9))?;
+        let policies = PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, 9))?;
+        let values = PyArray::from_vec(py, Vec::new());
+        return Ok((obs, policies, values));
+    }
+
+    let num_samples = samples.len();
+
+    // Convert notations to observations in parallel
+    let obs_data: Vec<i8> = samples
+        .par_iter()
+        .flat_map(|sample| {
+            let env = TicTacToe::from_notation(&sample.notation)
+                .expect("invalid TicTacToe notation in replay buffer");
+            env.board.to_vec()
+        })
+        .collect();
+
+    // Flatten policies
+    let policy_data: Vec<f32> = samples
+        .iter()
+        .flat_map(|s| s.policy.iter().copied())
+        .collect();
+
+    let values: Vec<f32> = samples.iter().map(|s| s.value).collect();
+
+    let obs = PyArray::from_vec(py, obs_data).reshape(Ix2(num_samples, 9))?;
+    let policies = PyArray::from_vec(py, policy_data).reshape(Ix2(num_samples, 9))?;
+    let values = PyArray::from_vec(py, values);
+
+    Ok((obs, policies, values))
+}
+
+/// Sample from replay buffer and convert notations to observations for Connect4.
+///
+/// Returns (observations, policies, values) as numpy arrays:
+/// - observations: (n, 6, 7) int8 array
+/// - policies: (n, 7) float32 array
+/// - values: (n,) float32 array
+#[pyfunction]
+fn sample_connect4<'py>(
+    py: Python<'py>,
+    replay_buffer: &PyReplayBuffer,
+    n: usize,
+    seed: u64,
+) -> PyResult<(
+    Bound<'py, PyArray<i8, Ix3>>,
+    Bound<'py, PyArray<f32, Ix2>>,
+    Bound<'py, PyArray<f32, Ix1>>,
+)> {
+    use environments::Connect4;
+    use ndarray::Array2;
+    use rayon::prelude::*;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let samples = replay_buffer.inner.sample(n, &mut rng);
+
+    if samples.is_empty() {
+        let obs = PyArray::from_vec(py, Vec::new()).reshape(Ix3(0, 6, 7))?;
+        let policies = PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, 7))?;
+        let values = PyArray::from_vec(py, Vec::new());
+        return Ok((obs, policies, values));
+    }
+
+    let num_samples = samples.len();
+
+    // Convert notations to observations in parallel
+    let obs_data: Vec<i8> = samples
+        .par_iter()
+        .flat_map(|sample| {
+            let env = Connect4::from_notation(&sample.notation)
+                .expect("invalid Connect4 notation in replay buffer");
+            let mut obs = Array2::<i8>::zeros((6, 7));
+            env.observation(obs.view_mut());
+            obs.into_raw_vec_and_offset().0
+        })
+        .collect();
+
+    // Flatten policies
+    let policy_data: Vec<f32> = samples
+        .iter()
+        .flat_map(|s| s.policy.iter().copied())
+        .collect();
+
+    let values: Vec<f32> = samples.iter().map(|s| s.value).collect();
+
+    let obs = PyArray::from_vec(py, obs_data).reshape(Ix3(num_samples, 6, 7))?;
+    let policies = PyArray::from_vec(py, policy_data).reshape(Ix2(num_samples, 7))?;
+    let values = PyArray::from_vec(py, values);
+
+    Ok((obs, policies, values))
+}
+
+/// Sample from replay buffer and convert notations to observations for ByteFight.
+///
+/// Returns (observations, policies, values) as numpy arrays:
+/// - observations: (n, 18) float32 array (heuristic features)
+/// - policies: (n, 11) float32 array
+/// - values: (n,) float32 array
+#[pyfunction]
+fn sample_bytefight<'py>(
+    py: Python<'py>,
+    replay_buffer: &PyReplayBuffer,
+    n: usize,
+    seed: u64,
+) -> PyResult<(
+    Bound<'py, PyArray<f32, Ix2>>,
+    Bound<'py, PyArray<f32, Ix2>>,
+    Bound<'py, PyArray<f32, Ix1>>,
+)> {
+    use environments::ByteFight;
+    use rayon::prelude::*;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let samples = replay_buffer.inner.sample(n, &mut rng);
+
+    if samples.is_empty() {
+        let obs = PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, 18))?;
+        let policies = PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, 11))?;
+        let values = PyArray::from_vec(py, Vec::new());
+        return Ok((obs, policies, values));
+    }
+
+    let num_samples = samples.len();
+
+    // Convert notations to observations (heuristics) in parallel
+    let obs_data: Vec<f32> = samples
+        .par_iter()
+        .flat_map(|sample| {
+            let env = ByteFight::from_notation(&sample.notation)
+                .expect("invalid ByteFight notation in replay buffer");
+            let mut obs = [0.0f32; 18];
+            env.observation(ndarray::ArrayViewMut1::from(&mut obs));
+            obs.to_vec()
+        })
+        .collect();
+
+    // Flatten policies
+    let policy_data: Vec<f32> = samples
+        .iter()
+        .flat_map(|s| s.policy.iter().copied())
+        .collect();
+
+    let values: Vec<f32> = samples.iter().map(|s| s.value).collect();
+
+    let obs = PyArray::from_vec(py, obs_data).reshape(Ix2(num_samples, 18))?;
+    let policies = PyArray::from_vec(py, policy_data).reshape(Ix2(num_samples, 11))?;
+    let values = PyArray::from_vec(py, values);
+
+    Ok((obs, policies, values))
+}
+
 /// Run TicTacToe self-play with Python model callback.
 ///
 /// The callback receives observations as a (BATCH_SIZE, 9) int8 numpy array.
@@ -424,6 +600,9 @@ fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(selfplay_tictactoe, m)?)?;
     m.add_function(wrap_pyfunction!(selfplay_connect4, m)?)?;
     m.add_function(wrap_pyfunction!(selfplay_bytefight, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_tictactoe, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_connect4, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_bytefight, m)?)?;
     Ok(())
 }
 
