@@ -1,7 +1,7 @@
 use ndarray::{ArrayView1, ArrayViewMut, Ix1};
 use serde::{Deserialize, Serialize};
 
-use crate::{Environment, Player, TerminalState};
+use crate::{Environment, GameNotation, Player, TerminalState};
 
 pub mod game;
 pub mod map;
@@ -9,7 +9,7 @@ pub mod pen;
 pub mod snake;
 pub mod types;
 
-pub use pen::ByteFightPen;
+pub use pen::{ByteFightPen, PenError};
 pub use types::{ByteFightAction, Point};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -98,6 +98,20 @@ impl Environment for ByteFight {
     }
 }
 
+impl GameNotation for ByteFight {
+    type Error = PenError;
+
+    fn to_notation(&self) -> String {
+        ByteFightPen::from(self).0
+    }
+
+    fn from_notation(s: &str) -> Result<Self, Self::Error> {
+        let pen = ByteFightPen(s.to_string());
+        let board = pen.into_board()?;
+        Ok(ByteFight { board })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Action;
@@ -126,6 +140,20 @@ mod tests {
         let pen = ByteFightPen::from(&board);
         let rebuilt = pen.clone().into_board().expect("valid pen");
         assert_eq!(pen.0, ByteFightPen::from(&rebuilt).0);
+    }
+
+    #[test]
+    fn test_notation_roundtrip() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let game = ByteFight {
+            board: game::Board::new_random(&mut rng),
+        };
+
+        let notation = game.to_notation();
+        let restored = ByteFight::from_notation(&notation).expect("valid notation");
+
+        // Compare via notation since board equality might differ in internal state
+        assert_eq!(notation, restored.to_notation());
     }
 
     #[rstest]
@@ -171,5 +199,32 @@ mod tests {
                 assert_eq!(ByteFightPen::from(&board).0, snapshot_pens[snapshot_idx]);
             }
         }
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(42)]
+    #[case(99)]
+    fn test_notation_roundtrip_after_moves(#[case] seed: u64) {
+        use crate::Environment;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut game = ByteFight {
+            board: game::Board::new_random(&mut rng),
+        };
+
+        // Apply some random moves
+        for _ in 0..20 {
+            let valid: Vec<_> = game.valid_actions().collect();
+            if valid.is_empty() {
+                break;
+            }
+            let idx = (rng.next_u64() as usize) % valid.len();
+            game.apply_action(valid[idx]);
+        }
+
+        let notation = game.to_notation();
+        let restored = ByteFight::from_notation(&notation).expect("valid notation");
+        assert_eq!(notation, restored.to_notation());
     }
 }

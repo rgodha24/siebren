@@ -240,11 +240,18 @@ pub trait Action: Copy + Eq + Hash {
     fn from_index(index: usize) -> Option<Self>;
 }
 
+/// Trait for serializing/deserializing game states to/from a string notation.
+pub trait GameNotation: Sized {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn to_notation(&self) -> String;
+    fn from_notation(s: &str) -> Result<Self, Self::Error>;
+}
+
 /// An environment implements a game that we want to train a model to play.
 ///
 /// Environments should support efficient rollback to step in and out of states
 /// without cloning.
-pub trait Environment: Clone + Hash + Debug {
+pub trait Environment: Clone + Hash + Debug + GameNotation {
     /// Element type of observations (u8, i8, f32, etc.)
     type ObsElem: Clone + Default + Send + Sync;
     /// Dimension of a single observation (Ix1, Ix2, etc.)

@@ -1,6 +1,7 @@
 use ndarray::{ArrayViewMut, Ix2};
+use std::fmt;
 
-use crate::{Action, Environment, Player, TerminalState};
+use crate::{Action, Environment, GameNotation, Player, TerminalState};
 
 const ROWS: usize = 6;
 const COLS: usize = 7;
@@ -160,6 +161,100 @@ impl Environment for Connect4 {
     }
 }
 
+#[derive(Debug)]
+pub struct Connect4NotationError(String);
+
+impl fmt::Display for Connect4NotationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Connect4NotationError {}
+
+impl GameNotation for Connect4 {
+    type Error = Connect4NotationError;
+
+    /// Format: "3425|A" (column moves history, A's turn)
+    /// Each digit (0-6) represents the column played.
+    fn to_notation(&self) -> String {
+        // Reconstruct moves by scanning columns from bottom to top
+        // We need to figure out the order of moves
+        // Since we don't store history, we'll encode the board state directly
+        // Format: 42 chars (6 rows * 7 cols) + "|" + player
+        // A=PlayerA, B=PlayerB, _=empty
+        let mut s = String::with_capacity(44);
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                s.push(match self.board[row][col] {
+                    Some(Player::PlayerA) => 'A',
+                    Some(Player::PlayerB) => 'B',
+                    None => '_',
+                });
+            }
+        }
+        s.push('|');
+        s.push(match self.current_player {
+            Player::PlayerA => 'A',
+            Player::PlayerB => 'B',
+        });
+        s
+    }
+
+    fn from_notation(s: &str) -> Result<Self, Self::Error> {
+        let parts: Vec<&str> = s.split('|').collect();
+        if parts.len() != 2 {
+            return Err(Connect4NotationError(
+                "expected format: BOARD|PLAYER".into(),
+            ));
+        }
+
+        let board_str = parts[0];
+        let player_str = parts[1];
+
+        if board_str.len() != ROWS * COLS {
+            return Err(Connect4NotationError(format!(
+                "board must have {} cells",
+                ROWS * COLS
+            )));
+        }
+
+        let mut board = [[None; COLS]; ROWS];
+        let mut move_count = 0u8;
+        let mut chars = board_str.chars();
+
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                let ch = chars.next().unwrap();
+                board[row][col] = match ch {
+                    'A' => {
+                        move_count += 1;
+                        Some(Player::PlayerA)
+                    }
+                    'B' => {
+                        move_count += 1;
+                        Some(Player::PlayerB)
+                    }
+                    '_' => None,
+                    _ => return Err(Connect4NotationError(format!("invalid cell char: {}", ch))),
+                };
+            }
+        }
+
+        let current_player = match player_str {
+            "A" => Player::PlayerA,
+            "B" => Player::PlayerB,
+            _ => return Err(Connect4NotationError("player must be A or B".into())),
+        };
+
+        Ok(Connect4 {
+            board,
+            current_player,
+            move_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +403,34 @@ mod tests {
         assert_eq!(obs[[5, 3]], 1); // PlayerA
         assert_eq!(obs[[4, 3]], -1); // PlayerB
         assert_eq!(obs[[0, 0]], 0); // Empty
+    }
+
+    #[test]
+    fn test_notation_roundtrip() {
+        // Test empty board
+        let game = Connect4::new();
+        let notation = game.to_notation();
+        assert_eq!(notation, "__________________________________________|A");
+        let restored = Connect4::from_notation(&notation).unwrap();
+        assert_eq!(game, restored);
+
+        // Test after some moves
+        let mut game = Connect4::new();
+        game.apply_action(Connect4Action(3)); // A at bottom row, col 3
+        game.apply_action(Connect4Action(3)); // B on top of A
+        game.apply_action(Connect4Action(0)); // A at bottom row, col 0
+
+        let notation = game.to_notation();
+        let restored = Connect4::from_notation(&notation).unwrap();
+        assert_eq!(game, restored);
+    }
+
+    #[test]
+    fn test_notation_errors() {
+        assert!(Connect4::from_notation("invalid").is_err());
+        assert!(Connect4::from_notation("___|A").is_err()); // too short
+        assert!(Connect4::from_notation("__________________________________________|C").is_err()); // invalid player
+        assert!(Connect4::from_notation("_________________________________________Z|A").is_err());
+        // invalid char
     }
 }

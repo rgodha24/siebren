@@ -1,6 +1,7 @@
 use ndarray::{ArrayView1, ArrayViewMut, Ix1};
+use std::fmt;
 
-use crate::{Action, Environment, Player, TerminalState};
+use crate::{Action, Environment, GameNotation, Player, TerminalState};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TicTacToeAction(pub u8);
@@ -124,6 +125,85 @@ impl Environment for TicTacToe {
     }
 }
 
+#[derive(Debug)]
+pub struct TicTacToeNotationError(String);
+
+impl fmt::Display for TicTacToeNotationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for TicTacToeNotationError {}
+
+impl GameNotation for TicTacToe {
+    type Error = TicTacToeNotationError;
+
+    /// Format: "XO_X_O___|A" (9 cells + current player)
+    /// X=PlayerA, O=PlayerB, _=empty
+    fn to_notation(&self) -> String {
+        let mut s = String::with_capacity(11);
+        for &cell in &self.board {
+            s.push(match cell {
+                1 => 'X',
+                -1 => 'O',
+                _ => '_',
+            });
+        }
+        s.push('|');
+        s.push(match self.current_player {
+            Player::PlayerA => 'A',
+            Player::PlayerB => 'B',
+        });
+        s
+    }
+
+    fn from_notation(s: &str) -> Result<Self, Self::Error> {
+        let parts: Vec<&str> = s.split('|').collect();
+        if parts.len() != 2 {
+            return Err(TicTacToeNotationError(
+                "expected format: BOARD|PLAYER".into(),
+            ));
+        }
+
+        let board_str = parts[0];
+        let player_str = parts[1];
+
+        if board_str.len() != 9 {
+            return Err(TicTacToeNotationError("board must have 9 cells".into()));
+        }
+
+        let mut board = [0i8; 9];
+        let mut move_count = 0u8;
+        for (i, ch) in board_str.chars().enumerate() {
+            board[i] = match ch {
+                'X' => {
+                    move_count += 1;
+                    1
+                }
+                'O' => {
+                    move_count += 1;
+                    -1
+                }
+                '_' => 0,
+                _ => return Err(TicTacToeNotationError(format!("invalid cell char: {}", ch))),
+            };
+        }
+
+        let current_player = match player_str {
+            "A" => Player::PlayerA,
+            "B" => Player::PlayerB,
+            _ => return Err(TicTacToeNotationError("player must be A or B".into())),
+        };
+
+        Ok(TicTacToe {
+            board,
+            current_player,
+            move_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,7 +248,7 @@ mod tests {
         game.apply_action(TicTacToeAction(0)); // PlayerA
         game.apply_action(TicTacToeAction(4)); // PlayerB
 
-        assert_eq!(game.board[0], 1);  // PlayerA = 1
+        assert_eq!(game.board[0], 1); // PlayerA = 1
         assert_eq!(game.board[4], -1); // PlayerB = -1
     }
 
@@ -202,5 +282,34 @@ mod tests {
         }
 
         assert_eq!(game.is_terminal(), Some(TerminalState::Draw));
+    }
+
+    #[test]
+    fn test_notation_roundtrip() {
+        // Test empty board
+        let game = TicTacToe::new();
+        let notation = game.to_notation();
+        assert_eq!(notation, "_________|A");
+        let restored = TicTacToe::from_notation(&notation).unwrap();
+        assert_eq!(game, restored);
+
+        // Test after some moves
+        let mut game = TicTacToe::new();
+        game.apply_action(TicTacToeAction(0)); // X at 0
+        game.apply_action(TicTacToeAction(4)); // O at 4
+        game.apply_action(TicTacToeAction(8)); // X at 8
+
+        let notation = game.to_notation();
+        assert_eq!(notation, "X___O___X|B");
+        let restored = TicTacToe::from_notation(&notation).unwrap();
+        assert_eq!(game, restored);
+    }
+
+    #[test]
+    fn test_notation_errors() {
+        assert!(TicTacToe::from_notation("invalid").is_err());
+        assert!(TicTacToe::from_notation("XXXXXXXX|A").is_err()); // 8 cells
+        assert!(TicTacToe::from_notation("_________|C").is_err()); // invalid player
+        assert!(TicTacToe::from_notation("____Z____|A").is_err()); // invalid char
     }
 }
