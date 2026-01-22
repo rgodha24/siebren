@@ -1,7 +1,10 @@
 //! Lock-free replay buffer for concurrent training data storage.
 
 use std::cell::UnsafeCell;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem::MaybeUninit;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::seq::index::sample;
@@ -129,6 +132,183 @@ impl ReplayBuffer {
             })
             .collect()
     }
+
+    /// Save buffer to binary file.
+    ///
+    /// File format (version 2):
+    /// - magic: 8 bytes "SIEBREN\0"
+    /// - version: u64 (little endian)
+    /// - generation_id: u64 (little endian)
+    /// - sample_count: u64 (little endian)
+    /// - max_notation_len: u64 (little endian) - max length of any notation
+    /// - policy_len: u64 (little endian)
+    /// - samples: for each sample:
+    ///   - notation_len: u64 (little endian) - actual length of this notation
+    ///   - notation: [u8; max_notation_len] - UTF-8 bytes, padded with zeros
+    ///   - policy: [f32; policy_len] (little endian)
+    ///   - value: f32 (little endian)
+    pub fn save(&self, path: &Path, generation_id: u64, policy_len: usize) -> io::Result<()> {
+        const MAGIC: &[u8; 8] = b"SIEBREN\0";
+        const VERSION: u64 = 2;
+
+        assert_eq!(
+            self.writers.load(Ordering::Acquire),
+            0,
+            "cannot save while writers are active"
+        );
+
+        let (tail, head) = self.valid_range();
+        let count = (head - tail) as u64;
+
+        // Find max notation length
+        let mut max_notation_len = 0usize;
+        for idx in tail..head {
+            let slot = idx as usize % self.capacity;
+            let sample = unsafe { (*self.data[slot].get()).assume_init_ref() };
+            max_notation_len = max_notation_len.max(sample.notation.len());
+        }
+
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        // Write header
+        writer.write_all(MAGIC)?;
+        writer.write_all(&VERSION.to_le_bytes())?;
+        writer.write_all(&generation_id.to_le_bytes())?;
+        writer.write_all(&count.to_le_bytes())?;
+        writer.write_all(&(max_notation_len as u64).to_le_bytes())?;
+        writer.write_all(&(policy_len as u64).to_le_bytes())?;
+
+        // Pre-allocate padding buffer
+        let mut notation_buf = vec![0u8; max_notation_len];
+
+        // Write samples
+        for idx in tail..head {
+            let slot = idx as usize % self.capacity;
+            let sample = unsafe { (*self.data[slot].get()).assume_init_ref() };
+
+            // Write notation length and padded notation
+            let notation_bytes = sample.notation.as_bytes();
+            writer.write_all(&(notation_bytes.len() as u64).to_le_bytes())?;
+            notation_buf[..notation_bytes.len()].copy_from_slice(notation_bytes);
+            notation_buf[notation_bytes.len()..].fill(0);
+            writer.write_all(&notation_buf)?;
+
+            // Write policy
+            for &p in &sample.policy {
+                writer.write_all(&p.to_le_bytes())?;
+            }
+
+            // Write value
+            writer.write_all(&sample.value.to_le_bytes())?;
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Load samples from binary file.
+    ///
+    /// Returns (samples_loaded, generation_id).
+    /// Panics if writers are active.
+    pub fn load(&self, path: &Path) -> io::Result<(usize, u64)> {
+        const MAGIC: &[u8; 8] = b"SIEBREN\0";
+
+        assert_eq!(
+            self.writers.load(Ordering::Acquire),
+            0,
+            "cannot load while writers are active"
+        );
+
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read and validate magic
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid magic bytes",
+            ));
+        }
+
+        // Read and validate version
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let version = u64::from_le_bytes(buf8);
+        if version != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported version: {version}, expected 2"),
+            ));
+        }
+
+        // Read header fields
+        reader.read_exact(&mut buf8)?;
+        let generation_id = u64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let sample_count = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let max_notation_len = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let policy_len = u64::from_le_bytes(buf8) as usize;
+
+        // Pre-allocate buffers
+        let mut notation_buf = vec![0u8; max_notation_len];
+        let mut policy_buf = vec![0u8; policy_len * 4];
+        let mut buf4 = [0u8; 4];
+
+        // Reserve space and read samples
+        let mut guard = self.reserve(sample_count);
+
+        for _ in 0..sample_count {
+            // Read notation length
+            reader.read_exact(&mut buf8)?;
+            let notation_len = u64::from_le_bytes(buf8) as usize;
+
+            if notation_len > max_notation_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "notation length {notation_len} exceeds max_notation_len {max_notation_len}"
+                    ),
+                ));
+            }
+
+            // Read padded notation
+            reader.read_exact(&mut notation_buf)?;
+            let notation =
+                String::from_utf8(notation_buf[..notation_len].to_vec()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid UTF-8 in notation: {e}"),
+                    )
+                })?;
+
+            // Read policy
+            reader.read_exact(&mut policy_buf)?;
+            let policy: Vec<f32> = policy_buf
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+
+            // Read value
+            reader.read_exact(&mut buf4)?;
+            let value = f32::from_le_bytes(buf4);
+
+            guard.push(Sample {
+                notation,
+                policy,
+                value,
+            });
+        }
+
+        Ok((sample_count, generation_id))
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +410,138 @@ mod tests {
 
         let _guard = buffer.reserve(5);
         let _ = buffer.sample(5, &mut rng);
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let buffer = ReplayBuffer::new(100);
+        let policy_len = 9;
+        let generation_id = 42u64;
+
+        // Add samples
+        {
+            let mut guard = buffer.reserve(5);
+            guard.extend((0..5).map(make_sample));
+        }
+
+        // Save to temp file
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_replay_buffer.bin");
+
+        buffer.save(&path, generation_id, policy_len).unwrap();
+
+        // Load into new buffer
+        let buffer2 = ReplayBuffer::new(100);
+        let (loaded_count, loaded_gen) = buffer2.load(&path).unwrap();
+
+        assert_eq!(loaded_count, 5);
+        assert_eq!(loaded_gen, generation_id);
+        assert_eq!(buffer2.len(), 5);
+
+        // Verify samples match
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let original = buffer.sample(5, &mut rng);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let loaded = buffer2.sample(5, &mut rng);
+
+        for (orig, load) in original.iter().zip(loaded.iter()) {
+            assert_eq!(orig.notation, load.notation);
+            assert_eq!(orig.policy, load.policy);
+            assert!((orig.value - load.value).abs() < 1e-6);
+        }
+
+        // Cleanup
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_save_load_generation_id() {
+        let buffer = ReplayBuffer::new(100);
+
+        {
+            let mut guard = buffer.reserve(1);
+            guard.push(make_sample(0));
+        }
+
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_replay_gen_id.bin");
+
+        // Save with specific generation ID
+        let gen_id = 12345u64;
+        buffer.save(&path, gen_id, 9).unwrap();
+
+        // Load and verify generation ID is preserved
+        let buffer2 = ReplayBuffer::new(100);
+        let (_, loaded_gen) = buffer2.load(&path).unwrap();
+        assert_eq!(loaded_gen, gen_id);
+
+        // Cleanup
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_save_load_varying_notation_lengths() {
+        let buffer = ReplayBuffer::new(100);
+
+        // Add samples with different notation lengths
+        {
+            let mut guard = buffer.reserve(3);
+            guard.push(Sample {
+                notation: "A".to_string(),
+                policy: vec![0.1; 9],
+                value: 0.5,
+            });
+            guard.push(Sample {
+                notation: "ABCDEFGHIJ".to_string(),
+                policy: vec![0.2; 9],
+                value: 0.6,
+            });
+            guard.push(Sample {
+                notation: "XYZ".to_string(),
+                policy: vec![0.3; 9],
+                value: 0.7,
+            });
+        }
+
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_replay_varying_notation.bin");
+
+        buffer.save(&path, 1, 9).unwrap();
+
+        let buffer2 = ReplayBuffer::new(100);
+        let (count, _) = buffer2.load(&path).unwrap();
+        assert_eq!(count, 3);
+
+        // Verify all notations preserved correctly
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let original = buffer.sample(3, &mut rng);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let loaded = buffer2.sample(3, &mut rng);
+
+        for (orig, load) in original.iter().zip(loaded.iter()) {
+            assert_eq!(orig.notation, load.notation);
+        }
+
+        // Cleanup
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_save_empty_buffer() {
+        let buffer = ReplayBuffer::new(100);
+
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_replay_empty.bin");
+
+        buffer.save(&path, 0, 9).unwrap();
+
+        let buffer2 = ReplayBuffer::new(100);
+        let (count, gen) = buffer2.load(&path).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(gen, 0);
+        assert_eq!(buffer2.len(), 0);
+
+        // Cleanup
+        std::fs::remove_file(&path).ok();
     }
 }

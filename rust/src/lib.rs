@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Debug, hash::Hash};
 
@@ -177,6 +178,32 @@ macro_rules! typed_replay_buffer {
                 let values = PyArray::from_vec(py, values);
 
                 Ok((obs, policies, values))
+            }
+
+            /// Save buffer to binary file.
+            ///
+            /// Args:
+            ///     path: Path to save the buffer to
+            ///     generation_id: Unique identifier for this training generation
+            ///
+            /// The file format includes magic bytes, version, and all sample data.
+            fn save(&self, path: &str, generation_id: u64) -> PyResult<()> {
+                self.inner
+                    .save(Path::new(path), generation_id, $num_actions)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+            }
+
+            /// Load samples from binary file.
+            ///
+            /// Args:
+            ///     path: Path to load the buffer from
+            ///
+            /// Returns:
+            ///     Tuple of (samples_loaded, generation_id)
+            fn load(&self, path: &str) -> PyResult<(usize, u64)> {
+                self.inner
+                    .load(Path::new(path))
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
             }
         }
 
