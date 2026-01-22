@@ -9,7 +9,8 @@ Usage:
 import argparse
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -42,6 +43,9 @@ class TrainConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     wandb_project: str = "siebren"
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_every: int = 10
+    resume: Optional[str] = None
 
 
 class TicTacToeNet(nn.Module):
@@ -138,6 +142,58 @@ class ByteFightNet(nn.Module):
         policy = self.policy_head(h)
         value = self.value_head(h).squeeze(-1).tanh()
         return policy, value
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    config: TrainConfig,
+    replay_buffer: "PyReplayBuffer",
+    checkpoint_dir: Path,
+) -> None:
+    """Save model and training state."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": vars(config),
+    }
+
+    # Save checkpoint
+    path = checkpoint_dir / f"checkpoint_epoch{epoch:04d}.pt"
+    torch.save(checkpoint, path)
+
+    # Also save as latest
+    latest = checkpoint_dir / "latest.pt"
+    torch.save(checkpoint, latest)
+
+    # Save replay buffer
+    buffer_path = checkpoint_dir / f"replay_buffer_epoch{epoch:04d}.bin"
+    replay_buffer.save(str(buffer_path))
+
+    print(f"Saved checkpoint to {path}")
+
+
+def load_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str,
+    replay_buffer: Optional["PyReplayBuffer"] = None,
+    buffer_path: Optional[str] = None,
+) -> int:
+    """Load model checkpoint. Returns epoch number."""
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    if replay_buffer is not None and buffer_path is not None:
+        loaded = replay_buffer.load(buffer_path)
+        print(f"Loaded {loaded} samples from replay buffer")
+
+    return checkpoint["epoch"]
 
 
 def make_execute_model(model: nn.Module, device: str, num_actions: int):
@@ -256,13 +312,33 @@ def train(config: TrainConfig):
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
     execute_model = make_execute_model(model, config.device, num_actions)
 
+    # Setup checkpoint directory
+    checkpoint_dir = Path(config.checkpoint_dir)
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if config.resume:
+        checkpoint_path = Path(config.resume)
+        buffer_path = checkpoint_path.parent / checkpoint_path.name.replace(
+            "checkpoint_", "replay_buffer_"
+        ).replace(".pt", ".bin")
+        start_epoch = load_checkpoint(
+            model,
+            optimizer,
+            str(checkpoint_path),
+            replay_buffer,
+            str(buffer_path) if buffer_path.exists() else None,
+        )
+        start_epoch += 1  # Start from the next epoch
+        print(f"Resumed from epoch {start_epoch - 1}, starting at epoch {start_epoch}")
+
     # Track metrics
     total_games = 0
     total_samples = 0
     total_batches = 0
-    global_step = 0
+    global_step = start_epoch
 
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
 
         # Self-play phase
@@ -349,6 +425,12 @@ def train(config: TrainConfig):
             f"{epoch_time:.1f}s"
         )
 
+        # Save checkpoint periodically
+        if (epoch + 1) % config.checkpoint_every == 0:
+            save_checkpoint(
+                model, optimizer, epoch, config, replay_buffer, checkpoint_dir
+            )
+
     wandb.finish()
 
 
@@ -400,6 +482,21 @@ def main():
     parser.add_argument(
         "--wandb-project", type=str, default="siebren", help="W&B project name"
     )
+    parser.add_argument(
+        "--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory"
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10,
+        help="Save checkpoint every N epochs",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
+    )
 
     args = parser.parse_args()
 
@@ -416,6 +513,9 @@ def main():
         seed=args.seed,
         device=args.device,
         wandb_project=args.wandb_project,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every=args.checkpoint_every,
+        resume=args.resume,
     )
 
     train(config)
