@@ -172,11 +172,12 @@ def save_checkpoint(
     latest = checkpoint_dir / "latest.pt"
     torch.save(checkpoint, latest)
 
-    # Save replay buffer
+    # Save replay buffer (only unsaved samples)
     buffer_path = checkpoint_dir / f"replay_buffer_epoch{epoch:04d}.bin"
-    replay_buffer.save(str(buffer_path))
+    samples_saved = replay_buffer.save(str(buffer_path), epoch)
+    replay_buffer.mark_saved()
 
-    print(f"Saved checkpoint to {path}")
+    print(f"Saved checkpoint to {path} ({samples_saved} new samples)")
 
 
 def load_checkpoint(
@@ -192,8 +193,10 @@ def load_checkpoint(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     if replay_buffer is not None and buffer_path is not None:
-        loaded = replay_buffer.load(buffer_path)
-        print(f"Loaded {loaded} samples from replay buffer")
+        samples_loaded, generation_id = replay_buffer.load(buffer_path)
+        print(
+            f"Loaded {samples_loaded} samples from replay buffer (generation {generation_id})"
+        )
 
     return checkpoint["epoch"]
 

@@ -180,17 +180,29 @@ macro_rules! typed_replay_buffer {
                 Ok((obs, policies, values))
             }
 
-            /// Save buffer to binary file.
+            /// Save unsaved samples to binary file.
+            ///
+            /// Only saves samples that haven't been saved yet. Call `mark_saved()`
+            /// after a successful save to update the tracking.
             ///
             /// Args:
             ///     path: Path to save the buffer to
             ///     generation_id: Unique identifier for this training generation
             ///
-            /// The file format includes magic bytes, version, and all sample data.
-            fn save(&self, path: &str, generation_id: u64) -> PyResult<()> {
+            /// Returns:
+            ///     Number of samples written to the file
+            fn save(&self, path: &str, generation_id: u64) -> PyResult<usize> {
                 self.inner
                     .save(Path::new(path), generation_id, $num_actions)
                     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+            }
+
+            /// Mark all current samples as saved.
+            ///
+            /// Call this after a successful `save()` to prevent those samples from
+            /// being saved again in subsequent calls.
+            fn mark_saved(&self) {
+                self.inner.mark_saved();
             }
 
             /// Load samples from binary file.

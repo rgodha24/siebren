@@ -24,6 +24,9 @@ pub struct ReplayBuffer {
     capacity: usize,
     head: AtomicU64,
     writers: AtomicU64,
+    /// Tracks the head position at the last save. Used to avoid saving
+    /// the same samples multiple times across checkpoints.
+    saved_head: AtomicU64,
 }
 
 unsafe impl Sync for ReplayBuffer {}
@@ -71,6 +74,7 @@ impl ReplayBuffer {
             capacity,
             head: AtomicU64::new(0),
             writers: AtomicU64::new(0),
+            saved_head: AtomicU64::new(0),
         }
     }
 
@@ -133,7 +137,12 @@ impl ReplayBuffer {
             .collect()
     }
 
-    /// Save buffer to binary file.
+    /// Save unsaved samples to binary file.
+    ///
+    /// Only saves samples that haven't been saved yet (from `saved_head` to `head`).
+    /// Call `mark_saved()` after a successful save to update the tracking.
+    ///
+    /// Returns the number of samples written.
     ///
     /// File format (version 2):
     /// - magic: 8 bytes "SIEBREN\0"
@@ -147,7 +156,7 @@ impl ReplayBuffer {
     ///   - notation: [u8; max_notation_len] - UTF-8 bytes, padded with zeros
     ///   - policy: [f32; policy_len] (little endian)
     ///   - value: f32 (little endian)
-    pub fn save(&self, path: &Path, generation_id: u64, policy_len: usize) -> io::Result<()> {
+    pub fn save(&self, path: &Path, generation_id: u64, policy_len: usize) -> io::Result<usize> {
         const MAGIC: &[u8; 8] = b"SIEBREN\0";
         const VERSION: u64 = 2;
 
@@ -157,12 +166,32 @@ impl ReplayBuffer {
             "cannot save while writers are active"
         );
 
-        let (tail, head) = self.valid_range();
-        let count = (head - tail) as u64;
+        let head = self.head.load(Ordering::Acquire);
+        let saved_head = self.saved_head.load(Ordering::Acquire);
+        let (tail, _) = self.valid_range();
 
-        // Find max notation length
+        // Only save samples from saved_head to head, but not before tail
+        // (samples before tail have been overwritten in the ring buffer)
+        let start = saved_head.max(tail);
+        let count = head.saturating_sub(start) as usize;
+
+        if count == 0 {
+            // Nothing new to save - still write an empty file for consistency
+            let file = File::create(path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(MAGIC)?;
+            writer.write_all(&VERSION.to_le_bytes())?;
+            writer.write_all(&generation_id.to_le_bytes())?;
+            writer.write_all(&0u64.to_le_bytes())?; // sample_count = 0
+            writer.write_all(&0u64.to_le_bytes())?; // max_notation_len = 0
+            writer.write_all(&(policy_len as u64).to_le_bytes())?;
+            writer.flush()?;
+            return Ok(0);
+        }
+
+        // Find max notation length in the range we're saving
         let mut max_notation_len = 0usize;
-        for idx in tail..head {
+        for idx in start..head {
             let slot = idx as usize % self.capacity;
             let sample = unsafe { (*self.data[slot].get()).assume_init_ref() };
             max_notation_len = max_notation_len.max(sample.notation.len());
@@ -175,7 +204,7 @@ impl ReplayBuffer {
         writer.write_all(MAGIC)?;
         writer.write_all(&VERSION.to_le_bytes())?;
         writer.write_all(&generation_id.to_le_bytes())?;
-        writer.write_all(&count.to_le_bytes())?;
+        writer.write_all(&(count as u64).to_le_bytes())?;
         writer.write_all(&(max_notation_len as u64).to_le_bytes())?;
         writer.write_all(&(policy_len as u64).to_le_bytes())?;
 
@@ -183,7 +212,7 @@ impl ReplayBuffer {
         let mut notation_buf = vec![0u8; max_notation_len];
 
         // Write samples
-        for idx in tail..head {
+        for idx in start..head {
             let slot = idx as usize % self.capacity;
             let sample = unsafe { (*self.data[slot].get()).assume_init_ref() };
 
@@ -204,7 +233,16 @@ impl ReplayBuffer {
         }
 
         writer.flush()?;
-        Ok(())
+        Ok(count)
+    }
+
+    /// Mark all current samples as saved.
+    ///
+    /// Call this after a successful `save()` to prevent those samples from
+    /// being saved again in subsequent calls.
+    pub fn mark_saved(&self) {
+        let head = self.head.load(Ordering::Acquire);
+        self.saved_head.store(head, Ordering::Release);
     }
 
     /// Load samples from binary file.
@@ -428,7 +466,8 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join("test_replay_buffer.bin");
 
-        buffer.save(&path, generation_id, policy_len).unwrap();
+        let saved_count = buffer.save(&path, generation_id, policy_len).unwrap();
+        assert_eq!(saved_count, 5);
 
         // Load into new buffer
         let buffer2 = ReplayBuffer::new(100);
@@ -533,7 +572,8 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join("test_replay_empty.bin");
 
-        buffer.save(&path, 0, 9).unwrap();
+        let saved_count = buffer.save(&path, 0, 9).unwrap();
+        assert_eq!(saved_count, 0);
 
         let buffer2 = ReplayBuffer::new(100);
         let (count, gen) = buffer2.load(&path).unwrap();
@@ -543,5 +583,112 @@ mod tests {
 
         // Cleanup
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_mark_saved_prevents_duplicates() {
+        let buffer = ReplayBuffer::new(100);
+        let temp_dir = std::env::temp_dir();
+
+        // Add first batch of samples
+        {
+            let mut guard = buffer.reserve(3);
+            guard.extend((0..3).map(make_sample));
+        }
+
+        // Save first batch
+        let path1 = temp_dir.join("test_mark_saved_1.bin");
+        let saved1 = buffer.save(&path1, 1, 9).unwrap();
+        assert_eq!(saved1, 3);
+        buffer.mark_saved();
+
+        // Add second batch
+        {
+            let mut guard = buffer.reserve(2);
+            guard.extend((10..12).map(make_sample));
+        }
+
+        // Save second batch - should only save the new samples
+        let path2 = temp_dir.join("test_mark_saved_2.bin");
+        let saved2 = buffer.save(&path2, 2, 9).unwrap();
+        assert_eq!(saved2, 2); // Only the new samples
+
+        // Buffer still has all 5 samples
+        assert_eq!(buffer.len(), 5);
+
+        // Load both files into separate buffers and verify no duplicates
+        let buffer1 = ReplayBuffer::new(100);
+        let (count1, _) = buffer1.load(&path1).unwrap();
+        assert_eq!(count1, 3);
+
+        let buffer2 = ReplayBuffer::new(100);
+        let (count2, _) = buffer2.load(&path2).unwrap();
+        assert_eq!(count2, 2);
+
+        // Cleanup
+        std::fs::remove_file(&path1).ok();
+        std::fs::remove_file(&path2).ok();
+    }
+
+    #[test]
+    fn test_save_without_mark_saved_resaves_all() {
+        let buffer = ReplayBuffer::new(100);
+        let temp_dir = std::env::temp_dir();
+
+        // Add samples
+        {
+            let mut guard = buffer.reserve(3);
+            guard.extend((0..3).map(make_sample));
+        }
+
+        // Save without calling mark_saved
+        let path1 = temp_dir.join("test_no_mark_saved_1.bin");
+        let saved1 = buffer.save(&path1, 1, 9).unwrap();
+        assert_eq!(saved1, 3);
+        // Note: NOT calling mark_saved()
+
+        // Save again - should save the same samples again
+        let path2 = temp_dir.join("test_no_mark_saved_2.bin");
+        let saved2 = buffer.save(&path2, 2, 9).unwrap();
+        assert_eq!(saved2, 3); // Same 3 samples saved again
+
+        // Cleanup
+        std::fs::remove_file(&path1).ok();
+        std::fs::remove_file(&path2).ok();
+    }
+
+    #[test]
+    fn test_save_respects_ring_buffer_overwrites() {
+        // Small buffer that will wrap around
+        let buffer = ReplayBuffer::new(5);
+        let temp_dir = std::env::temp_dir();
+
+        // Add 3 samples
+        {
+            let mut guard = buffer.reserve(3);
+            guard.extend((0..3).map(make_sample));
+        }
+
+        // Save and mark
+        let path1 = temp_dir.join("test_overwrite_1.bin");
+        let saved1 = buffer.save(&path1, 1, 9).unwrap();
+        assert_eq!(saved1, 3);
+        buffer.mark_saved();
+
+        // Add 4 more samples - this will overwrite some of the original samples
+        // Buffer now contains samples at positions 3,4,5,6 (positions 0,1,2 overwritten)
+        {
+            let mut guard = buffer.reserve(4);
+            guard.extend((10..14).map(make_sample));
+        }
+
+        // Save again - should only save the 4 new samples
+        let path2 = temp_dir.join("test_overwrite_2.bin");
+        let saved2 = buffer.save(&path2, 2, 9).unwrap();
+        assert_eq!(saved2, 4);
+
+        // Cleanup
+        std::fs::remove_file(&path1).ok();
+        std::fs::remove_file(&path2).ok();
     }
 }
