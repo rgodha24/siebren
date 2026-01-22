@@ -3,7 +3,6 @@
 //! This module provides the entry point for running parallel self-play
 //! with GPU-batched inference.
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -15,7 +14,8 @@ use rand_chacha::ChaCha8Rng;
 use crate::eval::{GpuEvaluator, PolicyValue};
 use crate::executor::Executor;
 use crate::queue::GpuJobQueue;
-use crate::worker::{worker_loop, TrainingSample, WorkerConfig};
+use crate::replay_buffer::ReplayBuffer;
+use crate::worker::{worker_loop, WorkerConfig};
 use crate::{BatchDim, Environment};
 
 /// Configuration for the training run.
@@ -29,8 +29,8 @@ pub struct TrainingConfig {
     pub worker: WorkerConfig,
     /// Random seed for reproducibility.
     pub seed: u64,
-    /// Total number of games to play across all workers.
-    pub total_games: usize,
+    /// Target number of samples to collect across all workers.
+    pub target_samples: usize,
 }
 
 impl Default for TrainingConfig {
@@ -40,17 +40,17 @@ impl Default for TrainingConfig {
             workers_per_thread: 16,
             worker: WorkerConfig::default(),
             seed: 42,
-            total_games: 10240,
+            target_samples: 102400,
         }
     }
 }
 
 /// Result of a training run.
-pub struct TrainingResult<E: Environment> {
+pub struct TrainingResult {
     /// Total number of games completed.
     pub games_completed: usize,
-    /// All training samples collected (from all threads).
-    pub samples: Vec<TrainingSample<E>>,
+    /// Total number of samples collected.
+    pub samples_collected: usize,
 }
 
 /// Run self-play training with the given configuration.
@@ -62,13 +62,16 @@ pub struct TrainingResult<E: Environment> {
 /// for GPU inference. It receives a zero-copy view of the batched observations
 /// and should fill the output policy/value pairs.
 ///
-/// Workers share an atomic counter for games completed. When the target is
+/// Workers share an atomic counter for samples collected. When the target is
 /// reached, remaining workers are cancelled via the executor. This allows
 /// fast workers to complete more games while slow workers are still playing.
+///
+/// Samples are pushed directly to the shared `replay_buffer` after each game.
 pub fn run_training<E, const NUM_ACTIONS: usize, F>(
     config: TrainingConfig,
+    replay_buffer: &ReplayBuffer,
     dispatch: F,
-) -> TrainingResult<E>
+) -> TrainingResult
 where
     E: Environment + Clone + Send + 'static,
     E::ObsDim: BatchDim,
@@ -79,69 +82,67 @@ where
         + Sync
         + 'static,
 {
-    let target_games = config.total_games;
+    let target_samples = config.target_samples;
 
-    // Shared counter for games completed across all workers
+    // Shared counters for samples collected and games completed across all workers
+    let samples_collected = Arc::new(AtomicUsize::new(0));
     let games_completed = Arc::new(AtomicUsize::new(0));
 
     // Create shared GPU queue with observation shape
     let queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>> =
         Arc::new(GpuJobQueue::new(E::OBS_SHAPE, dispatch));
 
-    // Spawn worker threads
-    let mut handles = Vec::with_capacity(config.num_threads);
+    // Use scoped threads to allow borrowing replay_buffer across threads
+    thread::scope(|s| {
+        for thread_id in 0..config.num_threads {
+            let queue = queue.clone();
+            let config = config.clone();
+            let samples_collected = samples_collected.clone();
+            let games_completed = games_completed.clone();
 
-    for thread_id in 0..config.num_threads {
-        let queue = queue.clone();
-        let config = config.clone();
-        let games_completed = games_completed.clone();
+            s.spawn(move || {
+                run_thread::<E, NUM_ACTIONS>(
+                    thread_id,
+                    queue,
+                    config,
+                    samples_collected,
+                    games_completed,
+                    target_samples,
+                    replay_buffer,
+                )
+            });
+        }
+    });
 
-        let handle = thread::spawn(move || {
-            run_thread::<E, NUM_ACTIONS>(thread_id, queue, config, games_completed, target_games)
-        });
-
-        handles.push(handle);
-    }
-
-    // Collect samples from all threads
-    let mut all_samples = Vec::new();
-    for handle in handles {
-        let thread_samples = handle.join().expect("worker thread panicked");
-        all_samples.extend(thread_samples);
-    }
-
-    let final_count = games_completed.load(Ordering::Acquire);
+    let final_samples = samples_collected.load(Ordering::Acquire);
+    let final_games = games_completed.load(Ordering::Acquire);
     TrainingResult {
-        games_completed: final_count,
-        samples: all_samples,
+        games_completed: final_games,
+        samples_collected: final_samples,
     }
 }
 
 /// Run a single worker thread with multiple async workers.
-/// Returns all samples collected by this thread.
 fn run_thread<E, const NUM_ACTIONS: usize>(
     thread_id: usize,
     queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>>,
     config: TrainingConfig,
+    samples_collected: Arc<AtomicUsize>,
     games_completed: Arc<AtomicUsize>,
-    target_games: usize,
-) -> Vec<TrainingSample<E>>
-where
+    target_samples: usize,
+    replay_buffer: &ReplayBuffer,
+) where
     E: Environment + Clone + 'static,
     E::ObsDim: BatchDim,
 {
     let base_seed = config.seed.wrapping_add(thread_id as u64 * 1000);
     let evaluator = GpuEvaluator::<E, NUM_ACTIONS>::new(&*queue);
 
-    let worker_samples: Vec<_> = (0..config.workers_per_thread)
-        .map(|_| RefCell::new(Vec::new()))
-        .collect();
-
     let futures: Vec<_> = (0..config.workers_per_thread)
         .map(|i| {
+            let samples_collected = samples_collected.clone();
             let games_completed = games_completed.clone();
             let mut rng = ChaCha8Rng::seed_from_u64(base_seed + i as u64);
-            let samples_ref = &worker_samples[i];
             let evaluator_ref = &evaluator;
             let worker_config = &config.worker;
 
@@ -150,9 +151,10 @@ where
                     evaluator_ref,
                     worker_config,
                     &mut rng,
+                    samples_collected,
                     games_completed,
-                    target_games,
-                    &mut samples_ref.borrow_mut(),
+                    target_samples,
+                    replay_buffer,
                 )
                 .await;
             }
@@ -166,7 +168,7 @@ where
             .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
             .collect(),
         || {
-            let done = games_completed.load(Ordering::Acquire) >= target_games;
+            let done = samples_collected.load(Ordering::Acquire) >= target_samples;
             if done {
                 queue.notify_all();
             }
@@ -174,15 +176,8 @@ where
         },
     );
 
-    let all_samples: Vec<TrainingSample<E>> = worker_samples
-        .into_iter()
-        .flat_map(|cell| cell.into_inner())
-        .collect();
-
     eprintln!(
-        "Thread {thread_id}: finished with {} samples collected",
-        all_samples.len()
+        "Thread {thread_id}: finished, total samples so far: {}",
+        samples_collected.load(Ordering::Acquire)
     );
-
-    all_samples
 }

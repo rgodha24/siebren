@@ -82,17 +82,18 @@ pub mod worker;
 /// - policy: (BATCH_SIZE, 9) float32 - action probabilities
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
-#[pyo3(signature = (num_threads, workers_per_thread, total_games, seed, execute_model))]
+#[pyo3(signature = (num_threads, workers_per_thread, target_samples, seed, execute_model))]
 fn selfplay_tictactoe(
     py: Python<'_>,
     num_threads: usize,
     workers_per_thread: usize,
-    total_games: usize,
+    target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
-) -> PyResult<usize> {
+) -> PyResult<(usize, usize)> {
     use environments::TicTacToe;
     use eval::PolicyValue;
+    use replay_buffer::ReplayBuffer;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
 
@@ -100,9 +101,12 @@ fn selfplay_tictactoe(
         num_threads,
         workers_per_thread,
         seed,
-        total_games,
+        target_samples,
         worker: WorkerConfig::default(),
     };
+
+    // Create replay buffer with enough capacity for target samples
+    let replay_buffer = ReplayBuffer::new(target_samples);
 
     let dispatch = move |obs_view: ArrayView<i8, Ix2>, outputs: &mut [PolicyValue<9>]| {
         Python::attach(|py| {
@@ -137,11 +141,9 @@ fn selfplay_tictactoe(
     };
 
     // Release GIL while running training, reacquire in dispatch callback
-    let result = py.detach(|| run_training::<TicTacToe, 9, _>(config, dispatch));
+    let result = py.detach(|| run_training::<TicTacToe, 9, _>(config, &replay_buffer, dispatch));
 
-    // TODO: Add result.samples to reservoir
-
-    Ok(result.games_completed)
+    Ok((result.games_completed, result.samples_collected))
 }
 
 /// Run Connect4 self-play with Python model callback.
@@ -154,17 +156,18 @@ fn selfplay_tictactoe(
 /// - policy: (BATCH_SIZE, 7) float32 - action probabilities for each column
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
-#[pyo3(signature = (num_threads, workers_per_thread, total_games, seed, execute_model))]
+#[pyo3(signature = (num_threads, workers_per_thread, target_samples, seed, execute_model))]
 fn selfplay_connect4(
     py: Python<'_>,
     num_threads: usize,
     workers_per_thread: usize,
-    total_games: usize,
+    target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
-) -> PyResult<usize> {
+) -> PyResult<(usize, usize)> {
     use environments::Connect4;
     use eval::PolicyValue;
+    use replay_buffer::ReplayBuffer;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
 
@@ -172,9 +175,12 @@ fn selfplay_connect4(
         num_threads,
         workers_per_thread,
         seed,
-        total_games,
+        target_samples,
         worker: WorkerConfig::default(),
     };
+
+    // Create replay buffer with enough capacity for target samples
+    let replay_buffer = ReplayBuffer::new(target_samples);
 
     let dispatch = move |obs_view: ArrayView<i8, Ix3>, outputs: &mut [PolicyValue<7>]| {
         Python::attach(|py| {
@@ -208,11 +214,9 @@ fn selfplay_connect4(
     };
 
     // Release GIL while running training, reacquire in dispatch callback
-    let result = py.detach(|| run_training::<Connect4, 7, _>(config, dispatch));
+    let result = py.detach(|| run_training::<Connect4, 7, _>(config, &replay_buffer, dispatch));
 
-    // TODO: Add result.samples to reservoir
-
-    Ok(result.games_completed)
+    Ok((result.games_completed, result.samples_collected))
 }
 
 #[pymodule]

@@ -177,10 +177,10 @@ mod tests {
         assert!(batches > 0);
     }
 
-    /// Test worker_loop runs until a global target of games is reached.
+    /// Test worker_loop runs until a global target of samples is reached.
     #[test]
     fn test_worker_loop_with_shared_counter() {
-        use crate::worker::TrainingSample;
+        use crate::replay_buffer::ReplayBuffer;
 
         let evaluator = SyncEvaluator::new(|_env: &TicTacToe| {
             let mut policy = vec![0.0; 9];
@@ -197,18 +197,17 @@ mod tests {
         let executor = Executor::new(|| event_listener::Event::new().listen());
 
         let num_workers = 8;
-        let target_games = 32;
+        let target_samples = 200; // ~32 games * 6 samples/game
+        let samples_collected = Arc::new(AtomicUsize::new(0));
         let games_completed = Arc::new(AtomicUsize::new(0));
-
-        // Each worker gets its own samples Vec
-        let worker_samples: Vec<RefCell<Vec<TrainingSample<TicTacToe>>>> =
-            (0..num_workers).map(|_| RefCell::new(Vec::new())).collect();
+        let replay_buffer = ReplayBuffer::new(1000);
 
         let futures: Vec<_> = (0..num_workers)
             .map(|i| {
                 let evaluator = &evaluator;
                 let config = &config;
-                let samples_ref = &worker_samples[i];
+                let replay_buffer = &replay_buffer;
+                let samples_collected = samples_collected.clone();
                 let games_completed = games_completed.clone();
                 let mut rng = ChaCha8Rng::seed_from_u64(i as u64);
                 async move {
@@ -216,9 +215,10 @@ mod tests {
                         evaluator,
                         config,
                         &mut rng,
+                        samples_collected,
                         games_completed,
-                        target_games,
-                        &mut samples_ref.borrow_mut(),
+                        target_samples,
+                        replay_buffer,
                     )
                     .await;
                 }
@@ -233,31 +233,35 @@ mod tests {
             || false,
         );
 
-        let completed = games_completed.load(Ordering::Relaxed);
-        let samples: usize = worker_samples.iter().map(|s| s.borrow().len()).sum();
-        // We complete at least target_games (may be slightly more due to race)
-        assert!(completed >= target_games);
-        assert!(samples >= target_games * 5);
+        let completed_games = games_completed.load(Ordering::Relaxed);
+        let collected_samples = samples_collected.load(Ordering::Relaxed);
+        // We collect at least target_samples (may be slightly more due to race)
+        assert!(collected_samples >= target_samples);
+        // TicTacToe games are 5-9 moves, so ~22-40 games for 200 samples
+        assert!(completed_games >= 20, "expected at least 20 games, got {completed_games}");
+        assert_eq!(replay_buffer.len(), collected_samples);
     }
 
     /// Test multithreaded worker_loop with shared counter using the sync evaluator.
     #[test]
     fn test_multithreaded_worker_loop() {
-        use crate::worker::TrainingSample;
+        use crate::replay_buffer::ReplayBuffer;
 
         const NUM_THREADS: usize = 2;
         const WORKERS_PER_THREAD: usize = 4;
-        const TARGET_GAMES: usize = 32;
+        const TARGET_SAMPLES: usize = 200; // ~32 games * 6 samples/game
 
         let total_samples = Arc::new(AtomicUsize::new(0));
         let games_completed = Arc::new(AtomicUsize::new(0));
+        let replay_buffer = ReplayBuffer::new(1000);
 
-        let handles: Vec<_> = (0..NUM_THREADS)
-            .map(|thread_id| {
+        thread::scope(|s| {
+            for thread_id in 0..NUM_THREADS {
+                let samples_collected = total_samples.clone();
                 let games_completed = games_completed.clone();
-                let total_samples = total_samples.clone();
+                let replay_buffer = &replay_buffer;
 
-                thread::spawn(move || {
+                s.spawn(move || {
                     let evaluator = SyncEvaluator::new(|_env: &TicTacToe| {
                         let mut policy = vec![0.0; 9];
                         policy[0] = 1.0;
@@ -272,17 +276,11 @@ mod tests {
                     };
                     let executor = Executor::new(|| event_listener::Event::new().listen());
 
-                    // Each worker gets its own samples Vec
-                    let worker_samples: Vec<RefCell<Vec<TrainingSample<TicTacToe>>>> = (0
-                        ..WORKERS_PER_THREAD)
-                        .map(|_| RefCell::new(Vec::new()))
-                        .collect();
-
                     let futures: Vec<_> = (0..WORKERS_PER_THREAD)
                         .map(|i| {
                             let evaluator = &evaluator;
                             let config = &config;
-                            let samples_ref = &worker_samples[i];
+                            let samples_collected = samples_collected.clone();
                             let games_completed = games_completed.clone();
                             let mut rng = ChaCha8Rng::seed_from_u64((thread_id * 1000 + i) as u64);
                             async move {
@@ -290,9 +288,10 @@ mod tests {
                                     evaluator,
                                     config,
                                     &mut rng,
+                                    samples_collected,
                                     games_completed,
-                                    TARGET_GAMES,
-                                    &mut samples_ref.borrow_mut(),
+                                    TARGET_SAMPLES,
+                                    replay_buffer,
                                 )
                                 .await;
                             }
@@ -309,26 +308,16 @@ mod tests {
                             .collect(),
                         || false,
                     );
+                });
+            }
+        });
 
-                    // Sum samples collected by this thread and report to global counter
-                    let thread_samples: usize =
-                        worker_samples.iter().map(|s| s.borrow().len()).sum();
-                    total_samples.fetch_add(thread_samples, Ordering::AcqRel);
-                    thread_samples
-                })
-            })
-            .collect();
+        let completed_games = games_completed.load(Ordering::Relaxed);
+        let collected_samples = total_samples.load(Ordering::Relaxed);
 
-        // Collect results from all threads
-        for handle in handles {
-            let _ = handle.join().expect("thread panicked");
-        }
-
-        let completed = games_completed.load(Ordering::Relaxed);
-        let samples = total_samples.load(Ordering::Relaxed);
-
-        // We complete at least TARGET_GAMES (may be slightly more due to race)
-        assert!(completed >= TARGET_GAMES);
-        assert!(samples >= TARGET_GAMES * 5);
+        // We collect at least TARGET_SAMPLES (may be slightly more due to race)
+        assert!(collected_samples >= TARGET_SAMPLES);
+        assert!(completed_games >= 30); // At least ~30 games to get 200 samples
+        assert_eq!(replay_buffer.len(), collected_samples);
     }
 }

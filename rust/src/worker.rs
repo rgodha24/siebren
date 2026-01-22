@@ -9,6 +9,7 @@ use rand::Rng;
 
 use crate::eval::Evaluator;
 use crate::mcts::{best_action_index, sample_action_index, visits_to_policy, MCTSConfig, MCTS};
+use crate::replay_buffer::{ReplayBuffer, Sample};
 use crate::{Action, Environment, TerminalState};
 
 /// A training sample from a single game step.
@@ -131,34 +132,51 @@ fn backfill_values<E: Environment>(samples: &mut [TrainingSample<E>], outcome: T
     }
 }
 
-/// Run a worker loop that plays games until the target is reached.
+/// Run a worker loop that plays games until the target sample count is reached.
 ///
-/// Workers play games and increment `games_completed` after each game.
-/// When the counter reaches `target_games`, workers stop. The executor's
+/// Workers play games and increment `samples_collected` after each game.
+/// When the counter reaches `target_samples`, workers stop. The executor's
 /// cancel callback should check this condition to terminate remaining workers.
 ///
-/// Samples are pushed to `samples_out` after each completed game. This ensures
-/// samples are preserved even if the future is cancelled mid-execution.
+/// Samples are pushed directly to the shared `replay_buffer` after each completed game.
 pub async fn worker_loop<E, V, R>(
     evaluator: &V,
     config: &WorkerConfig,
     rng: &mut R,
+    samples_collected: Arc<AtomicUsize>,
     games_completed: Arc<AtomicUsize>,
-    target_games: usize,
-    samples_out: &mut Vec<TrainingSample<E>>,
+    target_samples: usize,
+    replay_buffer: &ReplayBuffer,
 ) where
     E: Environment + Clone,
     V: Evaluator<E>,
     R: Rng,
 {
     loop {
-        if games_completed.load(Ordering::Acquire) >= target_games {
+        if samples_collected.load(Ordering::Acquire) >= target_samples {
             break;
         }
 
         let game_samples = play_game::<E, V, R>(evaluator, config, rng).await;
-        samples_out.extend(game_samples);
+        let num_samples = game_samples.len();
 
+        // Push samples to replay buffer
+        let start = replay_buffer.reserve(num_samples);
+        for (i, sample) in game_samples.iter().enumerate() {
+            // SAFETY: We just reserved these slots exclusively via reserve()
+            unsafe {
+                replay_buffer.write(
+                    start + i as u64,
+                    Sample {
+                        notation: sample.env.to_notation(),
+                        policy: sample.policy.clone(),
+                        value: sample.value,
+                    },
+                );
+            }
+        }
+
+        samples_collected.fetch_add(num_samples, Ordering::AcqRel);
         games_completed.fetch_add(1, Ordering::AcqRel);
     }
 }
