@@ -5,6 +5,8 @@
 //! data during concurrent writes, which is acceptable for training purposes.
 
 use std::cell::UnsafeCell;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::Rng;
@@ -125,6 +127,148 @@ impl ReplayBuffer {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Save all samples to a binary file.
+    ///
+    /// File format:
+    /// - Header: magic (8 bytes), version (u64), sample_count (u64),
+    ///   max_notation_len (u64), policy_len (u64)
+    /// - Per sample: notation (null-padded), policy (f32s), value (f32)
+    pub fn save(&self, path: &Path, max_notation_len: usize, policy_len: usize) -> io::Result<()> {
+        const MAGIC: &[u8; 8] = b"SIEBREN\0";
+        const VERSION: u64 = 1;
+
+        let file = std::fs::File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        // Collect valid samples
+        let (tail, head) = self.valid_range();
+        let sample_count = (head - tail) as usize;
+
+        // Write header
+        writer.write_all(MAGIC)?;
+        writer.write_all(&VERSION.to_le_bytes())?;
+        writer.write_all(&(sample_count as u64).to_le_bytes())?;
+        writer.write_all(&(max_notation_len as u64).to_le_bytes())?;
+        writer.write_all(&(policy_len as u64).to_le_bytes())?;
+
+        // Write each sample
+        for idx in tail..head {
+            let slot = idx as usize % self.capacity;
+            // SAFETY: slot is within bounds and in the valid range
+            let sample_opt = unsafe { &*self.data[slot].get() };
+            if let Some(sample) = sample_opt {
+                // Write notation (null-padded to max_notation_len)
+                let notation_bytes = sample.notation.as_bytes();
+                let notation_len = notation_bytes.len().min(max_notation_len);
+                writer.write_all(&notation_bytes[..notation_len])?;
+                // Pad with zeros
+                for _ in notation_len..max_notation_len {
+                    writer.write_all(&[0u8])?;
+                }
+
+                // Write policy (policy_len f32s)
+                for i in 0..policy_len {
+                    let val = sample.policy.get(i).copied().unwrap_or(0.0);
+                    writer.write_all(&val.to_le_bytes())?;
+                }
+
+                // Write value
+                writer.write_all(&sample.value.to_le_bytes())?;
+            }
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Load samples from a binary file into the buffer.
+    ///
+    /// Returns the number of samples loaded.
+    pub fn load(&self, path: &Path) -> io::Result<usize> {
+        const MAGIC: &[u8; 8] = b"SIEBREN\0";
+        const VERSION: u64 = 1;
+
+        let file = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read and validate header
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid magic bytes",
+            ));
+        }
+
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8)?;
+        let version = u64::from_le_bytes(buf8);
+        if version != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported version: {}", version),
+            ));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let sample_count = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let max_notation_len = u64::from_le_bytes(buf8) as usize;
+
+        reader.read_exact(&mut buf8)?;
+        let policy_len = u64::from_le_bytes(buf8) as usize;
+
+        // Read samples
+        let mut notation_buf = vec![0u8; max_notation_len];
+        let mut policy_buf = vec![0u8; policy_len * 4];
+        let mut value_buf = [0u8; 4];
+
+        let mut loaded = 0;
+        for _ in 0..sample_count {
+            // Read notation
+            if reader.read_exact(&mut notation_buf).is_err() {
+                break; // Truncated file - return what we have
+            }
+
+            // Trim null padding
+            let notation_end = notation_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(max_notation_len);
+            let notation = String::from_utf8_lossy(&notation_buf[..notation_end]).into_owned();
+
+            // Read policy
+            if reader.read_exact(&mut policy_buf).is_err() {
+                break;
+            }
+            let policy: Vec<f32> = policy_buf
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+
+            // Read value
+            if reader.read_exact(&mut value_buf).is_err() {
+                break;
+            }
+            let value = f32::from_le_bytes(value_buf);
+
+            // Push to buffer
+            let sample = Sample {
+                notation,
+                policy,
+                value,
+            };
+            let idx = self.reserve(1);
+            // SAFETY: We just reserved this slot exclusively
+            unsafe { self.write(idx, sample) };
+            loaded += 1;
+        }
+
+        Ok(loaded)
     }
 }
 
@@ -334,5 +478,105 @@ mod tests {
         // Request 100 samples - should get 100 (with repeats since we sample with replacement)
         let samples = buffer.sample(100, &mut rng);
         assert_eq!(samples.len(), 100);
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let buffer = ReplayBuffer::new(100);
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_replay_buffer.bin");
+
+        // Add samples with varying notation lengths and policy sizes
+        for i in 0..10 {
+            let idx = buffer.reserve(1);
+            unsafe { buffer.write(idx, make_sample(i)) };
+        }
+
+        // Save with fixed notation and policy lengths
+        let max_notation_len = 32;
+        let policy_len = 9;
+        buffer.save(&path, max_notation_len, policy_len).unwrap();
+
+        // Load into a new buffer
+        let buffer2 = ReplayBuffer::new(100);
+        let loaded = buffer2.load(&path).unwrap();
+
+        assert_eq!(loaded, 10);
+        assert_eq!(buffer2.len(), 10);
+
+        // Verify samples match
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let samples = buffer2.sample(10, &mut rng);
+        for sample in &samples {
+            assert!(sample.notation.starts_with("sample_"));
+            assert_eq!(sample.policy.len(), policy_len);
+        }
+
+        // Clean up
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let buffer = ReplayBuffer::new(100);
+        let path = std::path::Path::new("/nonexistent/path/file.bin");
+        let result = buffer.load(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_corrupt_file() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_corrupt_replay_buffer.bin");
+
+        // Write invalid magic bytes
+        std::fs::write(&path, b"INVALID\0").unwrap();
+
+        let buffer = ReplayBuffer::new(100);
+        let result = buffer.load(&path);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid magic bytes"));
+
+        // Clean up
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_truncated_file() {
+        let buffer = ReplayBuffer::new(100);
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("test_truncated_replay_buffer.bin");
+
+        // Add samples
+        for i in 0..5 {
+            let idx = buffer.reserve(1);
+            unsafe { buffer.write(idx, make_sample(i)) };
+        }
+
+        // Save
+        let max_notation_len = 32;
+        let policy_len = 9;
+        buffer.save(&path, max_notation_len, policy_len).unwrap();
+
+        // Truncate the file (keep header + partial data)
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Header is 40 bytes, truncate to header + 2 complete samples
+        let sample_size = max_notation_len + policy_len * 4 + 4;
+        let truncate_len = 40 + 2 * sample_size + 10; // partial third sample
+        file.set_len(truncate_len as u64).unwrap();
+
+        // Load should succeed with partial data
+        let buffer2 = ReplayBuffer::new(100);
+        let loaded = buffer2.load(&path).unwrap();
+
+        // Should have loaded at least 2 complete samples
+        assert!(loaded >= 2, "Expected at least 2 samples, got {}", loaded);
+        assert!(loaded < 5, "Expected fewer than 5 samples, got {}", loaded);
+
+        // Clean up
+        std::fs::remove_file(&path).ok();
     }
 }
