@@ -99,6 +99,37 @@ class Connect4Net(nn.Module):
         return policy, value
 
 
+class ByteFightNet(nn.Module):
+    """MLP for ByteFight (18 heuristic inputs -> 11 policy logits + 1 value)."""
+
+    def __init__(self, hidden_dim: int = 256):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(18, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.policy_head = nn.Linear(hidden_dim, 11)
+        self.value_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, 18) float32 heuristic features
+
+        Returns:
+            policy: (B, 11) action logits (not softmaxed)
+            value: (B,) position evaluation in [-1, 1]
+        """
+        h = self.trunk(x)
+        policy = self.policy_head(h)
+        value = self.value_head(h).squeeze(-1).tanh()
+        return policy, value
+
+
 def make_execute_model(model: nn.Module, device: str, num_actions: int):
     """Create the execute_model callback for self-play.
 
