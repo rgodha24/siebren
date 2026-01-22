@@ -69,6 +69,7 @@ pub mod future;
 mod integration_tests;
 pub mod mcts;
 pub mod queue;
+pub mod replay_buffer;
 pub mod training;
 pub mod worker;
 
