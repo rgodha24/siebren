@@ -10,7 +10,7 @@ import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -19,14 +19,16 @@ import torch.nn.functional as F
 import wandb
 
 from siebren import (
+    ByteFightReplayBuffer,
     ByteFightSelfPlay,
+    Connect4ReplayBuffer,
     Connect4SelfPlay,
-    PyReplayBuffer,
+    TicTacToeReplayBuffer,
     TicTacToeSelfPlay,
-    sample_bytefight,
-    sample_connect4,
-    sample_tictactoe,
 )
+
+# Type alias for the typed replay buffers
+ReplayBuffer = Union[TicTacToeReplayBuffer, Connect4ReplayBuffer, ByteFightReplayBuffer]
 
 
 @dataclass
@@ -149,7 +151,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     config: TrainConfig,
-    replay_buffer: "PyReplayBuffer",
+    replay_buffer: ReplayBuffer,
     checkpoint_dir: Path,
 ) -> None:
     """Save model and training state."""
@@ -181,7 +183,7 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     checkpoint_path: str,
-    replay_buffer: Optional["PyReplayBuffer"] = None,
+    replay_buffer: Optional[ReplayBuffer] = None,
     buffer_path: Optional[str] = None,
 ) -> int:
     """Load model checkpoint. Returns epoch number."""
@@ -223,8 +225,7 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
 def train_step(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    replay_buffer: PyReplayBuffer,
-    sample_fn: Callable,
+    replay_buffer: ReplayBuffer,
     batch_size: int,
     device: str,
     step: int,
@@ -233,7 +234,7 @@ def train_step(
     model.train()
 
     # Sample from replay buffer (converts notations to observations in Rust)
-    obs, policies, values = sample_fn(replay_buffer, batch_size, step)
+    obs, policies, values = replay_buffer.sample(batch_size, step)
 
     # Move to device
     obs = torch.from_numpy(obs).to(device)
@@ -275,10 +276,7 @@ def train(config: TrainConfig):
         name=f"{config.game}-{time.strftime('%Y%m%d-%H%M%S')}",
     )
 
-    # Create replay buffer
-    replay_buffer = PyReplayBuffer(config.replay_buffer_capacity)
-
-    # Setup model, selfplay, and sampling function based on game
+    # Setup model, selfplay, and replay buffer based on game
     if config.game == "tictactoe":
         model = TicTacToeNet().to(config.device)
         selfplay = TicTacToeSelfPlay(
@@ -287,7 +285,9 @@ def train(config: TrainConfig):
             seed=config.seed,
         )
         num_actions = 9
-        sample_fn = sample_tictactoe
+        replay_buffer: ReplayBuffer = TicTacToeReplayBuffer(
+            config.replay_buffer_capacity
+        )
     elif config.game == "connect4":
         model = Connect4Net().to(config.device)
         selfplay = Connect4SelfPlay(
@@ -296,7 +296,7 @@ def train(config: TrainConfig):
             seed=config.seed,
         )
         num_actions = 7
-        sample_fn = sample_connect4
+        replay_buffer = Connect4ReplayBuffer(config.replay_buffer_capacity)
     elif config.game == "bytefight":
         model = ByteFightNet().to(config.device)
         selfplay = ByteFightSelfPlay(
@@ -305,7 +305,7 @@ def train(config: TrainConfig):
             seed=config.seed,
         )
         num_actions = 11
-        sample_fn = sample_bytefight
+        replay_buffer = ByteFightReplayBuffer(config.replay_buffer_capacity)
     else:
         raise ValueError(f"Unknown game: {config.game}")
 
@@ -392,7 +392,6 @@ def train(config: TrainConfig):
                     model,
                     optimizer,
                     replay_buffer,
-                    sample_fn,
                     config.train_batch_size,
                     config.device,
                     global_step + step,

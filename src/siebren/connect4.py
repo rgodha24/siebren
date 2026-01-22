@@ -6,7 +6,7 @@ import numpy.typing as npt
 from . import siebren
 
 if TYPE_CHECKING:
-    from .siebren import PyReplayBuffer
+    from .siebren import Connect4ReplayBuffer
 
 
 class Connect4SelfPlay:
@@ -44,7 +44,7 @@ class Connect4SelfPlay:
 
     def play_games(
         self,
-        replay_buffer: "PyReplayBuffer",
+        replay_buffer: "Connect4ReplayBuffer",
         num_samples: int,
         execute_model: Callable[
             [npt.NDArray[np.int8]],

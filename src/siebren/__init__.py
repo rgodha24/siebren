@@ -5,11 +5,10 @@ from .bytefight import ByteFightSelfPlay
 
 __doc__ = siebren.__doc__  # type: ignore[name-defined]
 __all__ = [
-    "PyReplayBuffer",
+    "TicTacToeReplayBuffer",
+    "Connect4ReplayBuffer",
+    "ByteFightReplayBuffer",
     "TicTacToeSelfPlay",
     "Connect4SelfPlay",
     "ByteFightSelfPlay",
-    "sample_tictactoe",
-    "sample_connect4",
-    "sample_bytefight",
 ]

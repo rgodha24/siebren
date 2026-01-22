@@ -6,7 +6,7 @@ import numpy.typing as npt
 from . import siebren
 
 if TYPE_CHECKING:
-    from .siebren import PyReplayBuffer
+    from .siebren import TicTacToeReplayBuffer
 
 
 class TicTacToeSelfPlay:
@@ -43,7 +43,7 @@ class TicTacToeSelfPlay:
 
     def play_games(
         self,
-        replay_buffer: "PyReplayBuffer",
+        replay_buffer: "TicTacToeReplayBuffer",
         num_samples: int,
         execute_model: Callable[
             [npt.NDArray[np.int8]],
