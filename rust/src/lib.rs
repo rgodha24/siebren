@@ -348,11 +348,82 @@ fn selfplay_connect4(
     Ok((result.games_completed, result.samples_collected))
 }
 
+/// Run ByteFight self-play with Python model callback.
+///
+/// The callback receives observations as a (BATCH_SIZE, 18) float32 numpy array.
+/// Observations are 18 heuristic features computed from the game state.
+///
+/// Returns (policy, value) tuple where:
+/// - policy: (BATCH_SIZE, 11) float32 - action probabilities
+///   Actions: 0-7 = directions (N,NE,E,SE,S,SW,W,NW), 8=Trap, 9=FF, 10=EndTurn
+/// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
+#[pyfunction]
+#[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
+fn selfplay_bytefight(
+    py: Python<'_>,
+    replay_buffer: &PyReplayBuffer,
+    num_threads: usize,
+    workers_per_thread: usize,
+    target_samples: usize,
+    seed: u64,
+    execute_model: Py<PyAny>,
+) -> PyResult<(usize, usize)> {
+    use environments::ByteFight;
+    use eval::PolicyValue;
+    use training::{run_training, TrainingConfig};
+    use worker::WorkerConfig;
+
+    let config = TrainingConfig {
+        num_threads,
+        workers_per_thread,
+        seed,
+        target_samples,
+        worker: WorkerConfig::default(),
+    };
+
+    let dispatch = move |obs_view: ArrayView<f32, Ix2>, outputs: &mut [PolicyValue<11>]| {
+        Python::attach(|py| {
+            // Zero-copy numpy array from obs_view
+            // SAFETY: obs_view is valid for the duration of this callback,
+            // and the numpy array doesn't escape the callback scope.
+            let np_obs = unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
+
+            // Call Python: (BATCH_SIZE, 18) -> ((BATCH_SIZE, 11), (BATCH_SIZE,))
+            let result = execute_model
+                .call1(py, (np_obs,))
+                .expect("execute_model call failed");
+
+            let (policy_arr, value_arr): (
+                Bound<'_, PyArray<f32, Ix2>>,
+                Bound<'_, PyArray<f32, Ix1>>,
+            ) = result
+                .extract(py)
+                .expect("expected (policy, value) tuple of numpy arrays");
+
+            // Copy results back to PolicyValue outputs
+            let policy = unsafe { policy_arr.as_slice().unwrap() };
+            let value = unsafe { value_arr.as_slice().unwrap() };
+
+            for (i, out) in outputs.iter_mut().enumerate() {
+                out.policy.copy_from_slice(&policy[i * 11..(i + 1) * 11]);
+                out.value = value[i];
+            }
+        });
+    };
+
+    // Release GIL while running training, reacquire in dispatch callback
+    let result =
+        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch));
+
+    Ok((result.games_completed, result.samples_collected))
+}
+
 #[pymodule]
 fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyReplayBuffer>()?;
     m.add_function(wrap_pyfunction!(selfplay_tictactoe, m)?)?;
     m.add_function(wrap_pyfunction!(selfplay_connect4, m)?)?;
+    m.add_function(wrap_pyfunction!(selfplay_bytefight, m)?)?;
     Ok(())
 }
 
