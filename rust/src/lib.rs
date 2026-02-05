@@ -5,6 +5,7 @@ use std::{fmt::Debug, hash::Hash};
 use ndarray::{ArrayView, ArrayViewMut, Dimension, Ix0, Ix1, Ix2, Ix3, Ix4, Ix5, Ix6, RemoveAxis};
 use numpy::{PyArray, PyArrayMethods};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -299,7 +300,7 @@ fn selfplay_tictactoe(
     target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
-) -> PyResult<(usize, usize)> {
+) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
@@ -346,7 +347,14 @@ fn selfplay_tictactoe(
     let result =
         py.detach(|| run_training::<TicTacToe, 9, _>(config, replay_buffer.inner(), dispatch));
 
-    Ok((result.games_completed, result.samples_collected))
+    let stats = PyDict::new_bound(py);
+    stats.set_item("poll_rounds", result.executor.poll_rounds)?;
+    stats.set_item("futures_polled", result.executor.futures_polled)?;
+    stats.set_item("poll_ready", result.executor.poll_ready)?;
+    stats.set_item("poll_pending", result.executor.poll_pending)?;
+    stats.set_item("wait_count", result.executor.wait_count)?;
+
+    Ok((result.games_completed, result.samples_collected, stats.into()))
 }
 
 /// Run Connect4 self-play with Python model callback.
@@ -368,7 +376,7 @@ fn selfplay_connect4(
     target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
-) -> PyResult<(usize, usize)> {
+) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
@@ -415,7 +423,14 @@ fn selfplay_connect4(
     let result =
         py.detach(|| run_training::<Connect4, 7, _>(config, replay_buffer.inner(), dispatch));
 
-    Ok((result.games_completed, result.samples_collected))
+    let stats = PyDict::new_bound(py);
+    stats.set_item("poll_rounds", result.executor.poll_rounds)?;
+    stats.set_item("futures_polled", result.executor.futures_polled)?;
+    stats.set_item("poll_ready", result.executor.poll_ready)?;
+    stats.set_item("poll_pending", result.executor.poll_pending)?;
+    stats.set_item("wait_count", result.executor.wait_count)?;
+
+    Ok((result.games_completed, result.samples_collected, stats.into()))
 }
 
 /// Run ByteFight self-play with Python model callback.
@@ -437,7 +452,7 @@ fn selfplay_bytefight(
     target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
-) -> PyResult<(usize, usize)> {
+) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
@@ -484,7 +499,14 @@ fn selfplay_bytefight(
     let result =
         py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch));
 
-    Ok((result.games_completed, result.samples_collected))
+    let stats = PyDict::new_bound(py);
+    stats.set_item("poll_rounds", result.executor.poll_rounds)?;
+    stats.set_item("futures_polled", result.executor.futures_polled)?;
+    stats.set_item("poll_ready", result.executor.poll_ready)?;
+    stats.set_item("poll_pending", result.executor.poll_pending)?;
+    stats.set_item("wait_count", result.executor.wait_count)?;
+
+    Ok((result.games_completed, result.samples_collected, stats.into()))
 }
 
 #[pymodule]

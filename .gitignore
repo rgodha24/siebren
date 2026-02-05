@@ -75,3 +75,5 @@ rust/target/
 !rust/src/bin
 wandb/
 .opencode/
+
+experiments/bytefight_perf

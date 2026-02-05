@@ -3,7 +3,7 @@
 //! This module provides the entry point for running parallel self-play
 //! with GPU-batched inference.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -12,7 +12,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::eval::{GpuEvaluator, PolicyValue};
-use crate::executor::Executor;
+use crate::executor::{reset_executor_counters, take_executor_counters, Executor, ExecutorCounters};
 use crate::queue::GpuJobQueue;
 use crate::replay_buffer::ReplayBuffer;
 use crate::worker::{worker_loop, WorkerConfig};
@@ -51,6 +51,42 @@ pub struct TrainingResult {
     pub games_completed: usize,
     /// Total number of samples collected.
     pub samples_collected: usize,
+    /// Aggregated executor counters across worker threads.
+    pub executor: ExecutorCounters,
+}
+
+#[derive(Default)]
+struct ExecutorCountersAtomic {
+    poll_rounds: AtomicU64,
+    futures_polled: AtomicU64,
+    poll_ready: AtomicU64,
+    poll_pending: AtomicU64,
+    wait_count: AtomicU64,
+}
+
+impl ExecutorCountersAtomic {
+    fn add(&self, counters: ExecutorCounters) {
+        self.poll_rounds
+            .fetch_add(counters.poll_rounds, Ordering::Relaxed);
+        self.futures_polled
+            .fetch_add(counters.futures_polled, Ordering::Relaxed);
+        self.poll_ready
+            .fetch_add(counters.poll_ready, Ordering::Relaxed);
+        self.poll_pending
+            .fetch_add(counters.poll_pending, Ordering::Relaxed);
+        self.wait_count
+            .fetch_add(counters.wait_count, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ExecutorCounters {
+        ExecutorCounters {
+            poll_rounds: self.poll_rounds.load(Ordering::Relaxed),
+            futures_polled: self.futures_polled.load(Ordering::Relaxed),
+            poll_ready: self.poll_ready.load(Ordering::Relaxed),
+            poll_pending: self.poll_pending.load(Ordering::Relaxed),
+            wait_count: self.wait_count.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Run self-play training with the given configuration.
@@ -87,6 +123,7 @@ where
     // Shared counters for samples collected and games completed across all workers
     let samples_collected = Arc::new(AtomicUsize::new(0));
     let games_completed = Arc::new(AtomicUsize::new(0));
+    let executor_counters = Arc::new(ExecutorCountersAtomic::default());
 
     // Create shared GPU queue with observation shape
     let queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>> =
@@ -99,6 +136,7 @@ where
             let config = config.clone();
             let samples_collected = samples_collected.clone();
             let games_completed = games_completed.clone();
+            let executor_counters = executor_counters.clone();
 
             s.spawn(move || {
                 run_thread::<E, NUM_ACTIONS>(
@@ -108,6 +146,7 @@ where
                     samples_collected,
                     games_completed,
                     target_samples,
+                    executor_counters,
                     replay_buffer,
                 )
             });
@@ -116,9 +155,11 @@ where
 
     let final_samples = samples_collected.load(Ordering::Acquire);
     let final_games = games_completed.load(Ordering::Acquire);
+    let executor = executor_counters.snapshot();
     TrainingResult {
         games_completed: final_games,
         samples_collected: final_samples,
+        executor,
     }
 }
 
@@ -130,6 +171,7 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
     samples_collected: Arc<AtomicUsize>,
     games_completed: Arc<AtomicUsize>,
     target_samples: usize,
+    executor_counters: Arc<ExecutorCountersAtomic>,
     replay_buffer: &ReplayBuffer,
 ) where
     E: Environment + Clone + 'static,
@@ -162,6 +204,7 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
         .collect();
 
     let executor = Executor::new(|| queue.listen());
+    reset_executor_counters();
     executor.run(
         futures
             .into_iter()
@@ -175,6 +218,9 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
             done
         },
     );
+
+    let counters = take_executor_counters();
+    executor_counters.add(counters);
 
     eprintln!(
         "Thread {thread_id}: finished, total samples so far: {}",

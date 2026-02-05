@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Callable, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -49,8 +49,8 @@ class TicTacToeSelfPlay:
             [npt.NDArray[np.int8]],
             Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
         ],
-    ) -> Tuple[int, int]:
-        """Run self-play games and return (games_completed, samples_collected)."""
+    ) -> Tuple[int, int, Dict[str, int]]:
+        """Run self-play games and return (games_completed, samples_collected, executor_counters)."""
         return siebren.selfplay_tictactoe(
             replay_buffer,
             self.num_threads,

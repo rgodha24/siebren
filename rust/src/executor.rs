@@ -4,6 +4,7 @@
 //! requests. It doesn't use wakers - instead, it polls all futures in a tight
 //! loop and parks when no progress is made.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -11,6 +12,87 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use event_listener::{EventListener, Listener};
 
 use crate::future::{signal_progress, take_progress};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutorCounters {
+    pub poll_rounds: u64,
+    pub futures_polled: u64,
+    pub poll_ready: u64,
+    pub poll_pending: u64,
+    pub wait_count: u64,
+}
+
+thread_local! {
+    static EXEC_POLL_ROUNDS: Cell<u64> = Cell::new(0);
+    static EXEC_FUTURES_POLLED: Cell<u64> = Cell::new(0);
+    static EXEC_POLL_READY: Cell<u64> = Cell::new(0);
+    static EXEC_POLL_PENDING: Cell<u64> = Cell::new(0);
+    static EXEC_WAIT_COUNT: Cell<u64> = Cell::new(0);
+}
+
+fn inc_poll_round() {
+    EXEC_POLL_ROUNDS.with(|c| c.set(c.get() + 1));
+}
+
+fn inc_future_polled() {
+    EXEC_FUTURES_POLLED.with(|c| c.set(c.get() + 1));
+}
+
+fn inc_poll_ready() {
+    EXEC_POLL_READY.with(|c| c.set(c.get() + 1));
+}
+
+fn inc_poll_pending() {
+    EXEC_POLL_PENDING.with(|c| c.set(c.get() + 1));
+}
+
+fn inc_wait() {
+    EXEC_WAIT_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+pub fn reset_executor_counters() {
+    EXEC_POLL_ROUNDS.with(|c| c.set(0));
+    EXEC_FUTURES_POLLED.with(|c| c.set(0));
+    EXEC_POLL_READY.with(|c| c.set(0));
+    EXEC_POLL_PENDING.with(|c| c.set(0));
+    EXEC_WAIT_COUNT.with(|c| c.set(0));
+}
+
+pub fn take_executor_counters() -> ExecutorCounters {
+    let poll_rounds = EXEC_POLL_ROUNDS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    let futures_polled = EXEC_FUTURES_POLLED.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    let poll_ready = EXEC_POLL_READY.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    let poll_pending = EXEC_POLL_PENDING.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    let wait_count = EXEC_WAIT_COUNT.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+
+    ExecutorCounters {
+        poll_rounds,
+        futures_polled,
+        poll_ready,
+        poll_pending,
+        wait_count,
+    }
+}
 
 /// Create a dummy waker that does nothing.
 /// We don't use wakers for signaling - we use event_listener + progress tracking.
@@ -77,14 +159,19 @@ impl<'a> Executor<'a> {
                 take_progress();
 
                 // Poll all pending futures
+                inc_poll_round();
                 let mut i = 0;
                 while i < futures.len() {
-                    match futures[i].as_mut().poll(&mut cx) {
+                    let poll_result = futures[i].as_mut().poll(&mut cx);
+                    inc_future_polled();
+                    match poll_result {
                         Poll::Ready(()) => {
+                            inc_poll_ready();
                             futures.swap_remove(i);
                             signal_progress();
                         }
                         Poll::Pending => {
+                            inc_poll_pending();
                             i += 1;
                         }
                     }
@@ -105,14 +192,19 @@ impl<'a> Executor<'a> {
 
             // Double-check before parking and re-evaluate cancellation.
             take_progress();
+            inc_poll_round();
             let mut i = 0;
             while i < futures.len() {
-                match futures[i].as_mut().poll(&mut cx) {
+                let poll_result = futures[i].as_mut().poll(&mut cx);
+                inc_future_polled();
+                match poll_result {
                     Poll::Ready(()) => {
+                        inc_poll_ready();
                         futures.swap_remove(i);
                         signal_progress();
                     }
                     Poll::Pending => {
+                        inc_poll_pending();
                         i += 1;
                     }
                 }
@@ -123,6 +215,7 @@ impl<'a> Executor<'a> {
             }
 
             if !take_progress() {
+                inc_wait();
                 listener.wait();
             }
         }

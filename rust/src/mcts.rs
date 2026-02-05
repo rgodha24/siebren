@@ -20,7 +20,7 @@ pub struct MCTSConfig {
 impl Default for MCTSConfig {
     fn default() -> Self {
         Self {
-            num_simulations: 800,
+            num_simulations: 20,
             c_puct: 1.5,
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.25,

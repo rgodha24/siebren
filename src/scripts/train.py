@@ -48,6 +48,11 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 10
     resume: Optional[str] = None
+    compile: bool = False
+    compile_mode: str = "reduce-overhead"
+    compile_fullgraph: bool = False
+    cudagraphs: bool = False
+    matmul_precision: str = "high"
 
 
 class TicTacToeNet(nn.Module):
@@ -208,7 +213,7 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
     It runs inference and returns (policy, value) numpy arrays.
     """
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def execute_model(
         obs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -223,6 +228,44 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
         return policy, value
 
     return execute_model
+
+
+def configure_torch(config: TrainConfig) -> None:
+    if config.device.startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision(config.matmul_precision)
+        except Exception as exc:
+            print(
+                f"Warning: could not set matmul precision to {config.matmul_precision}: {exc}"
+            )
+
+
+def maybe_compile_model(model: nn.Module, config: TrainConfig) -> nn.Module:
+    if not config.compile:
+        return model
+    if not hasattr(torch, "compile"):
+        print("torch.compile unavailable; running eager.")
+        return model
+    if config.device.startswith("cuda"):
+        try:
+            import torch._inductor.config as inductor_config
+
+            inductor_config.triton.cudagraphs = bool(config.cudagraphs)
+            if hasattr(inductor_config.triton, "cudagraph_trees"):
+                inductor_config.triton.cudagraph_trees = bool(config.cudagraphs)
+        except Exception as exc:
+            print(f"Warning: unable to configure inductor cudagraphs: {exc}")
+    try:
+        compiled = torch.compile(
+            model, mode=config.compile_mode, fullgraph=config.compile_fullgraph
+        )
+        return compiled
+    except Exception as exc:
+        print(f"torch.compile failed ({exc}); running eager.")
+        return model
 
 
 def train_step(
@@ -279,6 +322,8 @@ def train(config: TrainConfig):
         name=f"{config.game}-{time.strftime('%Y%m%d-%H%M%S')}",
     )
 
+    configure_torch(config)
+
     # Setup model, selfplay, and replay buffer based on game
     if config.game == "tictactoe":
         model = TicTacToeNet().to(config.device)
@@ -312,8 +357,7 @@ def train(config: TrainConfig):
     else:
         raise ValueError(f"Unknown game: {config.game}")
 
-    optimizer = torch.optim.Muon(model.parameters(), lr=config.lr)
-    execute_model = make_execute_model(model, config.device, num_actions)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
 
     # Setup checkpoint directory
     checkpoint_dir = Path(config.checkpoint_dir)
@@ -335,6 +379,19 @@ def train(config: TrainConfig):
         start_epoch += 1  # Start from the next epoch
         print(f"Resumed from epoch {start_epoch - 1}, starting at epoch {start_epoch}")
 
+    if config.cudagraphs and not config.compile:
+        print("Warning: --cudagraphs set without --compile; cudagraphs disabled.")
+        config.cudagraphs = False
+    if config.cudagraphs and (config.num_threads * config.workers_per_thread) > 1:
+        print(
+            "Warning: cudagraphs with multithreaded self-play is unstable; "
+            "disabling cudagraphs."
+        )
+        config.cudagraphs = False
+
+    model = maybe_compile_model(model, config)
+    execute_model = make_execute_model(model, config.device, num_actions)
+
     # Track metrics
     total_games = 0
     total_samples = 0
@@ -353,7 +410,7 @@ def train(config: TrainConfig):
             return execute_model(obs)
 
         selfplay_start = time.time()
-        games_completed, samples_collected = selfplay.play_games(
+        games_completed, samples_collected, executor_stats = selfplay.play_games(
             replay_buffer=replay_buffer,
             num_samples=config.samples_per_epoch,
             execute_model=counting_execute_model,
@@ -374,6 +431,11 @@ def train(config: TrainConfig):
             "selfplay/games_per_sec": games_completed / selfplay_time,
             "selfplay/samples_per_sec": samples_collected / selfplay_time,
             "selfplay/batches_per_sec": batch_count[0] / selfplay_time,
+            "selfplay/executor_poll_rounds": executor_stats["poll_rounds"],
+            "selfplay/executor_futures_polled": executor_stats["futures_polled"],
+            "selfplay/executor_poll_ready": executor_stats["poll_ready"],
+            "selfplay/executor_poll_pending": executor_stats["poll_pending"],
+            "selfplay/executor_wait_count": executor_stats["wait_count"],
             "total/games": total_games,
             "total/samples": total_samples,
             "total/batches": total_batches,
@@ -499,6 +561,40 @@ def main():
         default=None,
         help="Path to checkpoint to resume from",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile for the model",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
+        choices=[
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
+        help="torch.compile mode",
+    )
+    parser.add_argument(
+        "--compile-fullgraph",
+        action="store_true",
+        help="Require full graph capture in torch.compile",
+    )
+    parser.add_argument(
+        "--cudagraphs",
+        action="store_true",
+        help="Enable inductor cudagraphs (requires --compile)",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        type=str,
+        default="high",
+        choices=["highest", "high", "medium"],
+        help="Set float32 matmul precision (CUDA only)",
+    )
 
     args = parser.parse_args()
 
@@ -518,6 +614,11 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
+        compile=args.compile,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
+        cudagraphs=args.cudagraphs,
+        matmul_precision=args.matmul_precision,
     )
 
     train(config)
