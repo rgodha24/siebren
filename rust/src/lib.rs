@@ -347,7 +347,7 @@ fn selfplay_tictactoe(
     let result =
         py.detach(|| run_training::<TicTacToe, 9, _>(config, replay_buffer.inner(), dispatch));
 
-    let stats = PyDict::new_bound(py);
+    let stats = PyDict::new(py);
     stats.set_item("poll_rounds", result.executor.poll_rounds)?;
     stats.set_item("futures_polled", result.executor.futures_polled)?;
     stats.set_item("poll_ready", result.executor.poll_ready)?;
@@ -423,7 +423,7 @@ fn selfplay_connect4(
     let result =
         py.detach(|| run_training::<Connect4, 7, _>(config, replay_buffer.inner(), dispatch));
 
-    let stats = PyDict::new_bound(py);
+    let stats = PyDict::new(py);
     stats.set_item("poll_rounds", result.executor.poll_rounds)?;
     stats.set_item("futures_polled", result.executor.futures_polled)?;
     stats.set_item("poll_ready", result.executor.poll_ready)?;
@@ -499,7 +499,7 @@ fn selfplay_bytefight(
     let result =
         py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch));
 
-    let stats = PyDict::new_bound(py);
+    let stats = PyDict::new(py);
     stats.set_item("poll_rounds", result.executor.poll_rounds)?;
     stats.set_item("futures_polled", result.executor.futures_polled)?;
     stats.set_item("poll_ready", result.executor.poll_ready)?;

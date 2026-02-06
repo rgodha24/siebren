@@ -10,14 +10,14 @@ import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 
+import wandb
 from siebren import (
     ByteFightReplayBuffer,
     ByteFightSelfPlay,
@@ -35,13 +35,15 @@ ReplayBuffer = Union[TicTacToeReplayBuffer, Connect4ReplayBuffer, ByteFightRepla
 class TrainConfig:
     game: str = "tictactoe"
     epochs: int = 100
-    samples_per_epoch: int = 4096
-    train_batch_size: int = 256
-    train_steps_per_epoch: int = 16
-    replay_buffer_capacity: int = 100_000
+    samples_per_epoch: int = 5_000_000
+    train_batch_size: int = 2048
+    train_steps_per_epoch: int = 256
+    replay_buffer_capacity: int = 50_000_000
     lr: float = 1e-3
+    value_loss_weight: float = 1.0
+    l2_weight: float = 1e-4
     num_threads: int = 32
-    workers_per_thread: int = 16
+    workers_per_thread: int = 256
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     wandb_project: str = "siebren"
@@ -159,6 +161,8 @@ def save_checkpoint(
     replay_buffer: ReplayBuffer,
     checkpoint_dir: Path,
 ) -> None:
+    # this shit uses SO MUCH STORAGE we dont need it
+    return
     """Save model and training state."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,6 +279,8 @@ def train_step(
     batch_size: int,
     device: str,
     step: int,
+    value_loss_weight: float,
+    l2_weight: float,
 ) -> Dict[str, float]:
     """One training step. Returns dict of losses."""
     model.train()
@@ -298,8 +304,15 @@ def train_step(
     # Value loss: MSE
     value_loss = F.mse_loss(pred_values, target_values)
 
+    # L2 regularization
+    l2_loss = torch.zeros((), device=device)
+    if l2_weight > 0.0:
+        for param in model.parameters():
+            if param.requires_grad:
+                l2_loss = l2_loss + param.pow(2).sum()
+
     # Total loss
-    total_loss = policy_loss + value_loss
+    total_loss = policy_loss + value_loss_weight * value_loss + l2_weight * l2_loss
 
     # Backward pass
     optimizer.zero_grad()
@@ -309,6 +322,7 @@ def train_step(
     return {
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
+        "l2_loss": l2_loss.item(),
         "total_loss": total_loss.item(),
     }
 
@@ -394,38 +408,55 @@ def train(config: TrainConfig):
 
     # Track metrics
     total_games = 0
-    total_samples = 0
     total_batches = 0
     global_step = start_epoch
+
+    # Batch counter - reused across epochs to avoid creating new closures
+    batch_count = [0]
+
+    def counting_execute_model(obs):
+        batch_count[0] += 1
+        return execute_model(obs)
 
     for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
 
         # Self-play phase
         model.eval()
-        batch_count = [0]
-
-        def counting_execute_model(obs):
-            batch_count[0] += 1
-            return execute_model(obs)
+        batch_count[0] = 0  # Reset counter for this epoch
 
         selfplay_start = time.time()
-        games_completed, samples_collected, executor_stats = selfplay.play_games(
+        selfplay_result = selfplay.play_games(
             replay_buffer=replay_buffer,
             num_samples=config.samples_per_epoch,
             execute_model=counting_execute_model,
         )
+        if len(selfplay_result) == 2:
+            games_completed, samples_collected = selfplay_result
+            executor_stats = {
+                "poll_rounds": 0,
+                "futures_polled": 0,
+                "poll_ready": 0,
+                "poll_pending": 0,
+                "wait_count": 0,
+            }
+        else:
+            games_completed, samples_collected, executor_stats = selfplay_result
         selfplay_time = time.time() - selfplay_start
 
         total_games += games_completed
-        total_samples += samples_collected
         total_batches += batch_count[0]
+
+        moves_per_game = (
+            samples_collected / games_completed if games_completed > 0 else 0.0
+        )
 
         # Log self-play metrics
         selfplay_metrics = {
             "epoch": epoch,
             "selfplay/games_completed": games_completed,
             "selfplay/samples_collected": samples_collected,
+            "selfplay/moves_per_game": moves_per_game,
             "selfplay/batches": batch_count[0],
             "selfplay/time_sec": selfplay_time,
             "selfplay/games_per_sec": games_completed / selfplay_time,
@@ -437,7 +468,6 @@ def train(config: TrainConfig):
             "selfplay/executor_poll_pending": executor_stats["poll_pending"],
             "selfplay/executor_wait_count": executor_stats["wait_count"],
             "total/games": total_games,
-            "total/samples": total_samples,
             "total/batches": total_batches,
             "replay_buffer/size": len(replay_buffer),
         }
@@ -450,6 +480,7 @@ def train(config: TrainConfig):
 
             epoch_policy_loss = 0.0
             epoch_value_loss = 0.0
+            epoch_l2_loss = 0.0
             epoch_total_loss = 0.0
 
             for step in range(config.train_steps_per_epoch):
@@ -460,9 +491,12 @@ def train(config: TrainConfig):
                     config.train_batch_size,
                     config.device,
                     global_step + step,
+                    config.value_loss_weight,
+                    config.l2_weight,
                 )
                 epoch_policy_loss += losses["policy_loss"]
                 epoch_value_loss += losses["value_loss"]
+                epoch_l2_loss += losses["l2_loss"]
                 epoch_total_loss += losses["total_loss"]
 
             train_time = time.time() - train_start
@@ -472,6 +506,7 @@ def train(config: TrainConfig):
             train_metrics = {
                 "train/policy_loss": epoch_policy_loss / num_steps,
                 "train/value_loss": epoch_value_loss / num_steps,
+                "train/l2_loss": epoch_l2_loss / num_steps,
                 "train/total_loss": epoch_total_loss / num_steps,
                 "train/time_sec": train_time,
                 "train/steps_per_sec": num_steps / train_time,
@@ -485,6 +520,7 @@ def train(config: TrainConfig):
         buffer_pct = 100 * len(replay_buffer) / config.replay_buffer_capacity
         print(
             f"Epoch {epoch}: {games_completed} games, {samples_collected} samples, "
+            f"{moves_per_game:.1f} moves/game, "
             f"buffer {len(replay_buffer)}/{config.replay_buffer_capacity} ({buffer_pct:.1f}%), "
             f"{epoch_time:.1f}s"
         )
@@ -511,30 +547,42 @@ def main():
     parser.add_argument(
         "--samples-per-epoch",
         type=int,
-        default=4096,
+        default=5_000_000,
         help="Target samples to collect per epoch",
     )
     parser.add_argument(
-        "--train-batch-size", type=int, default=256, help="Training batch size"
+        "--train-batch-size", type=int, default=2048, help="Training batch size"
     )
     parser.add_argument(
         "--train-steps-per-epoch",
         type=int,
-        default=16,
+        default=256,
         help="Training steps per epoch",
     )
     parser.add_argument(
         "--replay-buffer-capacity",
         type=int,
-        default=100_000,
+        default=50_000_000,
         help="Replay buffer capacity",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for value loss term",
+    )
+    parser.add_argument(
+        "--l2-weight",
+        type=float,
+        default=1e-4,
+        help="L2 regularization weight",
+    )
+    parser.add_argument(
         "--num-threads", type=int, default=32, help="Number of worker threads"
     )
     parser.add_argument(
-        "--workers-per-thread", type=int, default=16, help="Workers per thread"
+        "--workers-per-thread", type=int, default=256, help="Workers per thread"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -606,6 +654,8 @@ def main():
         train_steps_per_epoch=args.train_steps_per_epoch,
         replay_buffer_capacity=args.replay_buffer_capacity,
         lr=args.lr,
+        value_loss_weight=args.value_loss_weight,
+        l2_weight=args.l2_weight,
         num_threads=args.num_threads,
         workers_per_thread=args.workers_per_thread,
         seed=args.seed,

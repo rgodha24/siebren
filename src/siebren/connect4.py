@@ -15,7 +15,7 @@ class Connect4SelfPlay:
     IMPORTANT: num_threads * workers_per_thread must be >= 256 (the batch size).
     Workers submit observations to a shared queue that dispatches when full.
     With fewer workers than batch size, workers will deadlock waiting for a
-    batch that can never fill. Default config (32 * 16 = 512) is safe.
+    batch that can never fill. Default config (32 * 256 = 8192) is safe.
 
     The execute_model callback:
     - Input: (256, 6, 7) int8 array - board states (0=empty, 1=PlayerA, -1=PlayerB)
@@ -30,7 +30,7 @@ class Connect4SelfPlay:
     def __init__(
         self,
         num_threads: int = 32,
-        workers_per_thread: int = 16,
+        workers_per_thread: int = 256,
         seed: int = 42,
     ) -> None:
         total_workers = num_threads * workers_per_thread

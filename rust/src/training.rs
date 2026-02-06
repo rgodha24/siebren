@@ -222,8 +222,4 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
     let counters = take_executor_counters();
     executor_counters.add(counters);
 
-    eprintln!(
-        "Thread {thread_id}: finished, total samples so far: {}",
-        samples_collected.load(Ordering::Acquire)
-    );
 }

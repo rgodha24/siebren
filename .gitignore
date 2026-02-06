@@ -77,3 +77,4 @@ wandb/
 .opencode/
 
 experiments/bytefight_perf
+checkpoints/
