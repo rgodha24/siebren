@@ -16,6 +16,7 @@ mod tests {
     use crate::eval::{GpuEvaluator, PolicyValue, SyncEvaluator};
     use crate::executor::Executor;
     use crate::mcts::{MCTSConfig, MCTS};
+    use crate::observation_replay_buffer::ObservationReplayBuffer;
     use crate::queue::{GpuJobQueue, BATCH_SIZE};
     use crate::worker::{worker_loop, WorkerConfig};
     use crate::Environment;
@@ -180,8 +181,6 @@ mod tests {
     /// Test worker_loop runs until a global target of samples is reached.
     #[test]
     fn test_worker_loop_with_shared_counter() {
-        use crate::replay_buffer::ReplayBuffer;
-
         let evaluator = SyncEvaluator::new(|_env: &TicTacToe| {
             let mut policy = vec![0.0; 9];
             policy[0] = 1.0;
@@ -200,7 +199,7 @@ mod tests {
         let target_samples = 200; // ~32 games * 6 samples/game
         let samples_collected = Arc::new(AtomicUsize::new(0));
         let games_completed = Arc::new(AtomicUsize::new(0));
-        let replay_buffer = ReplayBuffer::new(1000);
+        let replay_buffer = ObservationReplayBuffer::<i8, Ix1, 9>::new(1000, TicTacToe::OBS_SHAPE);
 
         let futures: Vec<_> = (0..num_workers)
             .map(|i| {
@@ -211,7 +210,7 @@ mod tests {
                 let games_completed = games_completed.clone();
                 let mut rng = ChaCha8Rng::seed_from_u64(i as u64);
                 async move {
-                    worker_loop::<TicTacToe, _, _>(
+                    worker_loop::<TicTacToe, _, _, 9>(
                         evaluator,
                         config,
                         &mut rng,
@@ -248,15 +247,13 @@ mod tests {
     /// Test multithreaded worker_loop with shared counter using the sync evaluator.
     #[test]
     fn test_multithreaded_worker_loop() {
-        use crate::replay_buffer::ReplayBuffer;
-
         const NUM_THREADS: usize = 2;
         const WORKERS_PER_THREAD: usize = 4;
         const TARGET_SAMPLES: usize = 200; // ~32 games * 6 samples/game
 
         let total_samples = Arc::new(AtomicUsize::new(0));
         let games_completed = Arc::new(AtomicUsize::new(0));
-        let replay_buffer = ReplayBuffer::new(1000);
+        let replay_buffer = ObservationReplayBuffer::<i8, Ix1, 9>::new(1000, TicTacToe::OBS_SHAPE);
 
         thread::scope(|s| {
             for thread_id in 0..NUM_THREADS {
@@ -287,7 +284,7 @@ mod tests {
                             let games_completed = games_completed.clone();
                             let mut rng = ChaCha8Rng::seed_from_u64((thread_id * 1000 + i) as u64);
                             async move {
-                                worker_loop::<TicTacToe, _, _>(
+                                worker_loop::<TicTacToe, _, _, 9>(
                                     evaluator,
                                     config,
                                     &mut rng,

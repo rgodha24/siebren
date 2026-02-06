@@ -15,8 +15,8 @@ use crate::eval::{GpuEvaluator, PolicyValue};
 use crate::executor::{
     reset_executor_counters, take_executor_counters, Executor, ExecutorCounters,
 };
+use crate::observation_replay_buffer::ObservationReplayBuffer;
 use crate::queue::GpuJobQueue;
-use crate::replay_buffer::ReplayBuffer;
 use crate::worker::{worker_loop, WorkerConfig};
 use crate::{BatchDim, Environment};
 
@@ -107,7 +107,7 @@ impl ExecutorCountersAtomic {
 /// Samples are pushed directly to the shared `replay_buffer` after each game.
 pub fn run_training<E, const NUM_ACTIONS: usize, F>(
     config: TrainingConfig,
-    replay_buffer: &ReplayBuffer,
+    replay_buffer: &ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>,
     dispatch: F,
 ) -> TrainingResult
 where
@@ -174,7 +174,7 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
     games_completed: Arc<AtomicUsize>,
     target_samples: usize,
     executor_counters: Arc<ExecutorCountersAtomic>,
-    replay_buffer: &ReplayBuffer,
+    replay_buffer: &ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>,
 ) where
     E: Environment + Clone + 'static,
     E::ObsDim: BatchDim,
@@ -191,7 +191,7 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
             let worker_config = &config.worker;
 
             async move {
-                worker_loop::<E, _, _>(
+                worker_loop::<E, _, _, NUM_ACTIONS>(
                     evaluator_ref,
                     worker_config,
                     &mut rng,

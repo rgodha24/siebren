@@ -9,23 +9,31 @@ use rand::Rng;
 
 use crate::eval::Evaluator;
 use crate::mcts::{best_action_index, sample_action_index, visits_to_policy, MCTSConfig, MCTS};
-use crate::replay_buffer::{ReplayBuffer, Sample};
+use crate::observation_replay_buffer::ObservationReplayBuffer;
 use crate::{Action, Environment, Player, TerminalState};
 
 /// A training sample from a single game step.
 #[derive(Clone, Debug)]
 pub struct TrainingSample {
-    /// Serialized game state at this step.
-    pub notation: String,
+    /// Action index taken from this state.
+    pub action_idx: usize,
     /// The policy from MCTS (normalized visit counts).
     pub policy: Vec<f32>,
     /// The value from MCTS search.
     pub value: f32,
     /// Player to move at this step.
     ///
-    /// Notation often encodes current player, but keeping it here avoids
-    /// reparsing notation while backfilling terminal outcomes.
+    /// Keeping this here avoids reparsing game state while backfilling outcomes.
     pub player: Player,
+}
+
+/// Full trace of one played self-play game.
+#[derive(Clone, Debug)]
+pub struct PlayedGame<E: Environment> {
+    /// Initial environment state before any actions in this game.
+    pub initial_env: E,
+    /// Step samples in chronological order.
+    pub samples: Vec<TrainingSample>,
 }
 
 /// Configuration for the worker.
@@ -53,17 +61,14 @@ impl Default for WorkerConfig {
 /// Run a single self-play game, collecting training samples.
 ///
 /// Returns the collected samples. The game continues until terminal.
-pub async fn play_game<E, V, R>(
-    evaluator: &V,
-    config: &WorkerConfig,
-    rng: &mut R,
-) -> Vec<TrainingSample>
+pub async fn play_game<E, V, R>(evaluator: &V, config: &WorkerConfig, rng: &mut R) -> PlayedGame<E>
 where
     E: Environment,
     V: Evaluator<E>,
     R: Rng,
 {
     let mut env = E::new();
+    let initial_env = env.clone();
     let mut samples = Vec::new();
     let mut move_count = 0;
 
@@ -83,7 +88,6 @@ where
         };
         let policy = visits_to_policy(&visits, temp);
         let player = env.current_player();
-        let notation = env.to_notation();
 
         // Value is set to 0.0 here and backfilled with game outcome after the game ends.
         // This is standard AlphaZero practice - we use the actual game result rather than
@@ -102,8 +106,8 @@ where
 
         // Record sample
         samples.push(TrainingSample {
+            action_idx,
             player,
-            notation,
             policy,
             value,
         });
@@ -117,7 +121,10 @@ where
     let outcome = env.is_terminal().expect("game should be terminal");
     backfill_values(&mut samples, outcome);
 
-    samples
+    PlayedGame {
+        initial_env,
+        samples,
+    }
 }
 
 /// Backfill sample values with the game outcome.
@@ -146,34 +153,38 @@ fn backfill_values(samples: &mut [TrainingSample], outcome: TerminalState) {
 /// cancel callback should check this condition to terminate remaining workers.
 ///
 /// Samples are pushed directly to the shared `replay_buffer` after each completed game.
-pub async fn worker_loop<E, V, R>(
+pub async fn worker_loop<E, V, R, const NUM_ACTIONS: usize>(
     evaluator: &V,
     config: &WorkerConfig,
     rng: &mut R,
     samples_collected: Arc<AtomicUsize>,
     games_completed: Arc<AtomicUsize>,
     target_samples: usize,
-    replay_buffer: &ReplayBuffer,
+    replay_buffer: &ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>,
 ) where
     E: Environment + Clone,
     V: Evaluator<E>,
     R: Rng,
 {
+    debug_assert_eq!(NUM_ACTIONS, E::NUM_ACTIONS);
+
     loop {
         if samples_collected.load(Ordering::Acquire) >= target_samples {
             break;
         }
 
-        let game_samples = play_game::<E, V, R>(evaluator, config, rng).await;
-        let num_samples = game_samples.len();
+        let game = play_game::<E, V, R>(evaluator, config, rng).await;
+        let num_samples = game.samples.len();
 
-        // Push samples to replay buffer
+        // Push observations, policies, and values to replay buffer.
         let mut guard = replay_buffer.reserve(num_samples);
-        guard.extend(game_samples.into_iter().map(|s| Sample {
-            notation: s.notation,
-            policy: s.policy,
-            value: s.value,
-        }));
+        let mut env = game.initial_env;
+        for sample in game.samples {
+            guard.push_with_observation(&sample.policy, sample.value, |out| env.observation(out));
+            let action =
+                E::Action::from_index(sample.action_idx).expect("invalid action index in replay");
+            env.apply_action(action);
+        }
 
         samples_collected.fetch_add(num_samples, Ordering::AcqRel);
         games_completed.fetch_add(1, Ordering::AcqRel);
@@ -203,7 +214,7 @@ mod tests {
         };
 
         let rng = Rc::new(RefCell::new(ChaCha8Rng::seed_from_u64(42)));
-        let result: Rc<RefCell<Option<Vec<TrainingSample>>>> = Rc::new(RefCell::new(None));
+        let result: Rc<RefCell<Option<PlayedGame<TicTacToe>>>> = Rc::new(RefCell::new(None));
 
         let rng_clone = rng.clone();
         let result_clone = result.clone();
@@ -219,7 +230,8 @@ mod tests {
         let executor = Executor::new(|| event.listen());
         executor.run(vec![Box::pin(fut)], || false);
 
-        let samples = result.borrow().clone().unwrap();
+        let game = result.borrow_mut().take().unwrap();
+        let samples = game.samples;
 
         // TicTacToe games are 5-9 moves
         assert!(samples.len() >= 5);
@@ -242,8 +254,8 @@ mod tests {
     #[test]
     fn test_backfill_values_win() {
         let mut samples = vec![TrainingSample {
+            action_idx: 0,
             player: crate::Player::PlayerA,
-            notation: String::new(),
             policy: vec![],
             value: 0.0,
         }];
@@ -258,8 +270,8 @@ mod tests {
     #[test]
     fn test_backfill_values_draw() {
         let mut samples = vec![TrainingSample {
+            action_idx: 0,
             player: crate::Player::PlayerA,
-            notation: String::new(),
             policy: vec![],
             value: 0.5, // Should be overwritten
         }];

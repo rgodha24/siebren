@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Debug, hash::Hash};
 
@@ -8,7 +7,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use rayon::prelude::*;
 
 /// Extension trait for prepending a batch dimension to a shape.
 ///
@@ -75,37 +73,35 @@ pub mod executor;
 pub mod future;
 mod integration_tests;
 pub mod mcts;
+pub mod observation_replay_buffer;
 pub mod queue;
 pub mod replay_buffer;
 pub mod training;
 pub mod worker;
 
 use environments::{ByteFight, Connect4, TicTacToe};
-use replay_buffer::ReplayBuffer;
+use observation_replay_buffer::ObservationReplayBuffer;
 
-/// Macro to generate typed replay buffer classes for each environment.
+/// Macro to generate typed ephemeral replay buffer classes for each environment.
 ///
-/// Each generated class wraps an `Arc<ReplayBuffer>` and provides a `sample()`
-/// method that returns observations directly as numpy arrays, eliminating the
-/// need for separate `sample_*` functions.
-macro_rules! typed_replay_buffer {
+/// Each generated class wraps an `Arc<ObservationReplayBuffer<...>>` and
+/// exposes numpy sampling.
+macro_rules! typed_ephemeral_replay_buffer {
     (
         $name:ident,
-        $env:ty,
         $obs_ty:ty,
-        $obs_dim:ty,
-        $empty_obs_shape:expr,
+        $obs_single_dim:ty,
+        $obs_batched_dim:ty,
+        $obs_shape_const:expr,
         $obs_shape_fn:expr,
-        $num_actions:expr,
-        $obs_converter:expr
+        $num_actions:expr
     ) => {
-        #[doc = concat!("Typed replay buffer for ", stringify!($env), ".")]
+        #[doc = concat!("Typed ephemeral replay buffer for ", stringify!($name), ".")]
         #[doc = ""]
-        #[doc = "Stores training samples and provides efficient batched sampling"]
-        #[doc = "with automatic conversion from notation to observations."]
+        #[doc = "Stores contiguous observations, policies, and values in memory."]
         #[pyclass]
         pub struct $name {
-            inner: Arc<ReplayBuffer>,
+            inner: Arc<ObservationReplayBuffer<$obs_ty, $obs_single_dim, $num_actions>>,
         }
 
         #[pymethods]
@@ -113,7 +109,7 @@ macro_rules! typed_replay_buffer {
             #[new]
             fn new(capacity: usize) -> Self {
                 Self {
-                    inner: Arc::new(ReplayBuffer::new(capacity)),
+                    inner: Arc::new(ObservationReplayBuffer::new(capacity, $obs_shape_const)),
                 }
             }
 
@@ -140,146 +136,68 @@ macro_rules! typed_replay_buffer {
                 n: usize,
                 seed: u64,
             ) -> PyResult<(
-                Bound<'py, PyArray<$obs_ty, $obs_dim>>,
+                Bound<'py, PyArray<$obs_ty, $obs_batched_dim>>,
                 Bound<'py, PyArray<f32, Ix2>>,
                 Bound<'py, PyArray<f32, Ix1>>,
             )> {
                 let mut rng = ChaCha8Rng::seed_from_u64(seed);
-                let samples = self.inner.sample(n, &mut rng);
+                let batch = self.inner.sample(n, &mut rng);
+                let num_samples = batch.values.len();
 
-                if samples.is_empty() {
-                    let obs = PyArray::from_vec(py, Vec::new()).reshape($empty_obs_shape)?;
-                    let policies =
-                        PyArray::from_vec(py, Vec::new()).reshape(Ix2(0, $num_actions))?;
-                    let values = PyArray::from_vec(py, Vec::new());
-                    return Ok((obs, policies, values));
-                }
+                let obs_data = batch.observations.into_raw_vec_and_offset().0;
+                let policy_data = batch.policies.into_raw_vec_and_offset().0;
 
-                let num_samples = samples.len();
-
-                // Convert notations to observations in parallel
-                let converter: fn(&str) -> Vec<$obs_ty> = $obs_converter;
-                let obs_data: Vec<$obs_ty> = samples
-                    .par_iter()
-                    .flat_map(|sample| converter(&sample.notation))
-                    .collect();
-
-                // Flatten policies
-                let policy_data: Vec<f32> = samples
-                    .iter()
-                    .flat_map(|s| s.policy.iter().copied())
-                    .collect();
-
-                let values: Vec<f32> = samples.iter().map(|s| s.value).collect();
-
-                let shape_fn: fn(usize) -> $obs_dim = $obs_shape_fn;
+                let shape_fn: fn(usize) -> $obs_batched_dim = $obs_shape_fn;
                 let obs = PyArray::from_vec(py, obs_data).reshape(shape_fn(num_samples))?;
                 let policies =
                     PyArray::from_vec(py, policy_data).reshape(Ix2(num_samples, $num_actions))?;
-                let values = PyArray::from_vec(py, values);
+                let values = PyArray::from_vec(py, batch.values);
 
                 Ok((obs, policies, values))
-            }
-
-            /// Save unsaved samples to binary file.
-            ///
-            /// Only saves samples that haven't been saved yet. Call `mark_saved()`
-            /// after a successful save to update the tracking.
-            ///
-            /// Args:
-            ///     path: Path to save the buffer to
-            ///     generation_id: Unique identifier for this training generation
-            ///
-            /// Returns:
-            ///     Number of samples written to the file
-            fn save(&self, path: &str, generation_id: u64) -> PyResult<usize> {
-                self.inner
-                    .save(Path::new(path), generation_id, $num_actions)
-                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-            }
-
-            /// Mark all current samples as saved.
-            ///
-            /// Call this after a successful `save()` to prevent those samples from
-            /// being saved again in subsequent calls.
-            fn mark_saved(&self) {
-                self.inner.mark_saved();
-            }
-
-            /// Load samples from binary file.
-            ///
-            /// Args:
-            ///     path: Path to load the buffer from
-            ///
-            /// Returns:
-            ///     Tuple of (samples_loaded, generation_id)
-            fn load(&self, path: &str) -> PyResult<(usize, u64)> {
-                self.inner
-                    .load(Path::new(path))
-                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
             }
         }
 
         impl $name {
-            pub fn inner(&self) -> &Arc<ReplayBuffer> {
+            pub fn inner(
+                &self,
+            ) -> &Arc<ObservationReplayBuffer<$obs_ty, $obs_single_dim, $num_actions>> {
                 &self.inner
             }
         }
     };
 }
 
-// TicTacToe: (n, 9) i8 observations, 9 actions
-typed_replay_buffer!(
-    TicTacToeReplayBuffer,
-    TicTacToe,
+// TicTacToe: observations (9,) i8, sampled as (n, 9)
+typed_ephemeral_replay_buffer!(
+    TicTacToeEphemeralReplayBuffer,
     i8,
+    Ix1,
     Ix2,
-    Ix2(0, 9),
+    TicTacToe::OBS_SHAPE,
     |n| Ix2(n, 9),
-    9,
-    |notation: &str| -> Vec<i8> {
-        let env = TicTacToe::from_notation(notation)
-            .expect("invalid TicTacToe notation in replay buffer");
-        env.board.to_vec()
-    }
+    9
 );
 
-// Connect4: (n, 6, 7) i8 observations, 7 actions
-typed_replay_buffer!(
-    Connect4ReplayBuffer,
-    Connect4,
+// Connect4: observations (6, 7) i8, sampled as (n, 6, 7)
+typed_ephemeral_replay_buffer!(
+    Connect4EphemeralReplayBuffer,
     i8,
+    Ix2,
     Ix3,
-    Ix3(0, 6, 7),
+    Connect4::OBS_SHAPE,
     |n| Ix3(n, 6, 7),
-    7,
-    |notation: &str| -> Vec<i8> {
-        use ndarray::Array2;
-        let env =
-            Connect4::from_notation(notation).expect("invalid Connect4 notation in replay buffer");
-        let mut obs = Array2::<i8>::zeros((6, 7));
-        env.observation(obs.view_mut());
-        obs.into_raw_vec_and_offset().0
-    }
+    7
 );
 
-// ByteFight: (n, 18) f32 observations, 11 actions
-typed_replay_buffer!(
-    ByteFightReplayBuffer,
-    ByteFight,
+// ByteFight: observations (18,) f32, sampled as (n, 18)
+typed_ephemeral_replay_buffer!(
+    ByteFightEphemeralReplayBuffer,
     f32,
+    Ix1,
     Ix2,
-    Ix2(0, 18),
+    ByteFight::OBS_SHAPE,
     |n| Ix2(n, 18),
-    11,
-    |notation: &str| -> Vec<f32> {
-        use ndarray::ArrayViewMut1;
-        let env = ByteFight::from_notation(notation)
-            .expect("invalid ByteFight notation in replay buffer");
-        let mut obs = [0.0f32; 18];
-        env.observation(ArrayViewMut1::from(&mut obs));
-        obs.to_vec()
-    }
+    11
 );
 
 /// Run TicTacToe self-play with Python model callback.
@@ -292,9 +210,9 @@ typed_replay_buffer!(
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
 #[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
-fn selfplay_tictactoe(
+fn selfplay_tictactoe_ephemeral(
     py: Python<'_>,
-    replay_buffer: &TicTacToeReplayBuffer,
+    replay_buffer: &TicTacToeEphemeralReplayBuffer,
     num_threads: usize,
     workers_per_thread: usize,
     target_samples: usize,
@@ -372,9 +290,9 @@ fn selfplay_tictactoe(
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
 #[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
-fn selfplay_connect4(
+fn selfplay_connect4_ephemeral(
     py: Python<'_>,
-    replay_buffer: &Connect4ReplayBuffer,
+    replay_buffer: &Connect4EphemeralReplayBuffer,
     num_threads: usize,
     workers_per_thread: usize,
     target_samples: usize,
@@ -452,9 +370,9 @@ fn selfplay_connect4(
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
 #[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
-fn selfplay_bytefight(
+fn selfplay_bytefight_ephemeral(
     py: Python<'_>,
-    replay_buffer: &ByteFightReplayBuffer,
+    replay_buffer: &ByteFightEphemeralReplayBuffer,
     num_threads: usize,
     workers_per_thread: usize,
     target_samples: usize,
@@ -523,12 +441,12 @@ fn selfplay_bytefight(
 
 #[pymodule]
 fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<TicTacToeReplayBuffer>()?;
-    m.add_class::<Connect4ReplayBuffer>()?;
-    m.add_class::<ByteFightReplayBuffer>()?;
-    m.add_function(wrap_pyfunction!(selfplay_tictactoe, m)?)?;
-    m.add_function(wrap_pyfunction!(selfplay_connect4, m)?)?;
-    m.add_function(wrap_pyfunction!(selfplay_bytefight, m)?)?;
+    m.add_class::<TicTacToeEphemeralReplayBuffer>()?;
+    m.add_class::<Connect4EphemeralReplayBuffer>()?;
+    m.add_class::<ByteFightEphemeralReplayBuffer>()?;
+    m.add_function(wrap_pyfunction!(selfplay_tictactoe_ephemeral, m)?)?;
+    m.add_function(wrap_pyfunction!(selfplay_connect4_ephemeral, m)?)?;
+    m.add_function(wrap_pyfunction!(selfplay_bytefight_ephemeral, m)?)?;
     Ok(())
 }
 

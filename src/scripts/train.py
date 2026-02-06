@@ -10,7 +10,7 @@ import argparse
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,16 +19,9 @@ import torch.nn.functional as F
 
 import wandb
 from siebren import (
-    ByteFightReplayBuffer,
-    ByteFightSelfPlay,
-    Connect4ReplayBuffer,
-    Connect4SelfPlay,
-    TicTacToeReplayBuffer,
-    TicTacToeSelfPlay,
+    EphemeralReplayBuffer,
+    SelfPlay,
 )
-
-# Type alias for the typed replay buffers
-ReplayBuffer = Union[TicTacToeReplayBuffer, Connect4ReplayBuffer, ByteFightReplayBuffer]
 
 
 @dataclass
@@ -158,7 +151,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     config: TrainConfig,
-    replay_buffer: ReplayBuffer,
+    replay_buffer: EphemeralReplayBuffer,
     checkpoint_dir: Path,
 ) -> None:
     # this shit uses SO MUCH STORAGE we dont need it
@@ -193,7 +186,7 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     checkpoint_path: str,
-    replay_buffer: Optional[ReplayBuffer] = None,
+    replay_buffer: Optional[EphemeralReplayBuffer] = None,
     buffer_path: Optional[str] = None,
 ) -> int:
     """Load model checkpoint. Returns epoch number."""
@@ -202,7 +195,7 @@ def load_checkpoint(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     if replay_buffer is not None and buffer_path is not None:
-        samples_loaded, generation_id = replay_buffer.load(buffer_path)
+        samples_loaded, generation_id = replay_buffer.load(buffer_path)  # type: ignore[attr-defined]
         print(
             f"Loaded {samples_loaded} samples from replay buffer (generation {generation_id})"
         )
@@ -275,7 +268,7 @@ def maybe_compile_model(model: nn.Module, config: TrainConfig) -> nn.Module:
 def train_step(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    replay_buffer: ReplayBuffer,
+    replay_buffer: EphemeralReplayBuffer,
     batch_size: int,
     device: str,
     step: int,
@@ -285,7 +278,7 @@ def train_step(
     """One training step. Returns dict of losses."""
     model.train()
 
-    # Sample from replay buffer (converts notations to observations in Rust)
+    # Sample from replay buffer
     obs, policies, values = replay_buffer.sample(batch_size, step)
 
     # Move to device
@@ -338,38 +331,29 @@ def train(config: TrainConfig):
 
     configure_torch(config)
 
-    # Setup model, selfplay, and replay buffer based on game
+    # Setup model and action space based on game
     if config.game == "tictactoe":
         model = TicTacToeNet().to(config.device)
-        selfplay = TicTacToeSelfPlay(
-            num_threads=config.num_threads,
-            workers_per_thread=config.workers_per_thread,
-            seed=config.seed,
-        )
         num_actions = 9
-        replay_buffer: ReplayBuffer = TicTacToeReplayBuffer(
-            config.replay_buffer_capacity
-        )
     elif config.game == "connect4":
         model = Connect4Net().to(config.device)
-        selfplay = Connect4SelfPlay(
-            num_threads=config.num_threads,
-            workers_per_thread=config.workers_per_thread,
-            seed=config.seed,
-        )
         num_actions = 7
-        replay_buffer = Connect4ReplayBuffer(config.replay_buffer_capacity)
     elif config.game == "bytefight":
         model = ByteFightNet().to(config.device)
-        selfplay = ByteFightSelfPlay(
-            num_threads=config.num_threads,
-            workers_per_thread=config.workers_per_thread,
-            seed=config.seed,
-        )
         num_actions = 11
-        replay_buffer = ByteFightReplayBuffer(config.replay_buffer_capacity)
     else:
         raise ValueError(f"Unknown game: {config.game}")
+
+    selfplay = SelfPlay(
+        game=config.game,
+        num_threads=config.num_threads,
+        workers_per_thread=config.workers_per_thread,
+        seed=config.seed,
+    )
+    replay_buffer = EphemeralReplayBuffer(
+        config.replay_buffer_capacity,
+        game=config.game,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
 
@@ -431,17 +415,7 @@ def train(config: TrainConfig):
             num_samples=config.samples_per_epoch,
             execute_model=counting_execute_model,
         )
-        if len(selfplay_result) == 2:
-            games_completed, samples_collected = selfplay_result
-            executor_stats = {
-                "poll_rounds": 0,
-                "futures_polled": 0,
-                "poll_ready": 0,
-                "poll_pending": 0,
-                "wait_count": 0,
-            }
-        else:
-            games_completed, samples_collected, executor_stats = selfplay_result
+        games_completed, samples_collected, executor_stats = selfplay_result
         selfplay_time = time.time() - selfplay_start
 
         total_games += games_completed
