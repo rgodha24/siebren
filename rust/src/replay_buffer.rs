@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem::MaybeUninit;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rand::seq::index::sample;
 use rand::Rng;
@@ -21,6 +21,11 @@ pub struct Sample {
 /// Lock-free ring buffer for storing training samples.
 pub struct ReplayBuffer {
     data: Box<[UnsafeCell<MaybeUninit<Sample>>]>,
+    /// Tracks whether each slot has ever been initialized.
+    ///
+    /// This is separate from `saved_head`: save checkpoints can be marked at
+    /// arbitrary points, but overwrite safety needs per-slot init state.
+    initialized: Box<[AtomicBool]>,
     capacity: usize,
     head: AtomicU64,
     writers: AtomicU64,
@@ -46,8 +51,12 @@ impl<'a> ReserveGuard<'a> {
         assert!(self.written < self.len, "wrote more samples than reserved");
         let idx = (self.start + self.written as u64) as usize % self.buffer.capacity;
         unsafe {
+            if self.buffer.initialized[idx].load(Ordering::Acquire) {
+                (*self.buffer.data[idx].get()).assume_init_drop();
+            }
             (*self.buffer.data[idx].get()).write(sample);
         }
+        self.buffer.initialized[idx].store(true, Ordering::Release);
         self.written += 1;
     }
 
@@ -71,6 +80,7 @@ impl ReplayBuffer {
             .collect();
         Self {
             data: data.into_boxed_slice(),
+            initialized: (0..capacity).map(|_| AtomicBool::new(false)).collect(),
             capacity,
             head: AtomicU64::new(0),
             writers: AtomicU64::new(0),
@@ -346,6 +356,18 @@ impl ReplayBuffer {
         }
 
         Ok((sample_count, generation_id))
+    }
+}
+
+impl Drop for ReplayBuffer {
+    fn drop(&mut self) {
+        for idx in 0..self.capacity {
+            if self.initialized[idx].load(Ordering::Relaxed) {
+                unsafe {
+                    (*self.data[idx].get()).assume_init_drop();
+                }
+            }
+        }
     }
 }
 

@@ -12,7 +12,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::eval::{GpuEvaluator, PolicyValue};
-use crate::executor::{reset_executor_counters, take_executor_counters, Executor, ExecutorCounters};
+use crate::executor::{
+    reset_executor_counters, take_executor_counters, Executor, ExecutorCounters,
+};
 use crate::queue::GpuJobQueue;
 use crate::replay_buffer::ReplayBuffer;
 use crate::worker::{worker_loop, WorkerConfig};
@@ -221,5 +223,4 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
 
     let counters = take_executor_counters();
     executor_counters.add(counters);
-
 }

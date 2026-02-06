@@ -255,8 +255,8 @@ typed_replay_buffer!(
     7,
     |notation: &str| -> Vec<i8> {
         use ndarray::Array2;
-        let env = Connect4::from_notation(notation)
-            .expect("invalid Connect4 notation in replay buffer");
+        let env =
+            Connect4::from_notation(notation).expect("invalid Connect4 notation in replay buffer");
         let mut obs = Array2::<i8>::zeros((6, 7));
         env.observation(obs.view_mut());
         obs.into_raw_vec_and_offset().0
@@ -354,7 +354,11 @@ fn selfplay_tictactoe(
     stats.set_item("poll_pending", result.executor.poll_pending)?;
     stats.set_item("wait_count", result.executor.wait_count)?;
 
-    Ok((result.games_completed, result.samples_collected, stats.into()))
+    Ok((
+        result.games_completed,
+        result.samples_collected,
+        stats.into(),
+    ))
 }
 
 /// Run Connect4 self-play with Python model callback.
@@ -430,7 +434,11 @@ fn selfplay_connect4(
     stats.set_item("poll_pending", result.executor.poll_pending)?;
     stats.set_item("wait_count", result.executor.wait_count)?;
 
-    Ok((result.games_completed, result.samples_collected, stats.into()))
+    Ok((
+        result.games_completed,
+        result.samples_collected,
+        stats.into(),
+    ))
 }
 
 /// Run ByteFight self-play with Python model callback.
@@ -506,7 +514,11 @@ fn selfplay_bytefight(
     stats.set_item("poll_pending", result.executor.poll_pending)?;
     stats.set_item("wait_count", result.executor.wait_count)?;
 
-    Ok((result.games_completed, result.samples_collected, stats.into()))
+    Ok((
+        result.games_completed,
+        result.samples_collected,
+        stats.into(),
+    ))
 }
 
 #[pymodule]

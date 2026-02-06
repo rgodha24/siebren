@@ -10,17 +10,22 @@ use rand::Rng;
 use crate::eval::Evaluator;
 use crate::mcts::{best_action_index, sample_action_index, visits_to_policy, MCTSConfig, MCTS};
 use crate::replay_buffer::{ReplayBuffer, Sample};
-use crate::{Action, Environment, TerminalState};
+use crate::{Action, Environment, Player, TerminalState};
 
 /// A training sample from a single game step.
 #[derive(Clone, Debug)]
-pub struct TrainingSample<E: Environment> {
-    /// The environment state at this step.
-    pub env: E,
+pub struct TrainingSample {
+    /// Serialized game state at this step.
+    pub notation: String,
     /// The policy from MCTS (normalized visit counts).
     pub policy: Vec<f32>,
     /// The value from MCTS search.
     pub value: f32,
+    /// Player to move at this step.
+    ///
+    /// Notation often encodes current player, but keeping it here avoids
+    /// reparsing notation while backfilling terminal outcomes.
+    pub player: Player,
 }
 
 /// Configuration for the worker.
@@ -52,9 +57,9 @@ pub async fn play_game<E, V, R>(
     evaluator: &V,
     config: &WorkerConfig,
     rng: &mut R,
-) -> Vec<TrainingSample<E>>
+) -> Vec<TrainingSample>
 where
-    E: Environment + Clone,
+    E: Environment,
     V: Evaluator<E>,
     R: Rng,
 {
@@ -77,18 +82,13 @@ where
             0.0
         };
         let policy = visits_to_policy(&visits, temp);
+        let player = env.current_player();
+        let notation = env.to_notation();
 
         // Value is set to 0.0 here and backfilled with game outcome after the game ends.
         // This is standard AlphaZero practice - we use the actual game result rather than
         // the search value estimate for training.
         let value = 0.0;
-
-        // Record sample
-        samples.push(TrainingSample {
-            env: env.clone(),
-            policy: policy.clone(),
-            value,
-        });
 
         // Select action
         let action_idx = if temp > 0.0 {
@@ -99,6 +99,14 @@ where
 
         let action_idx = action_idx.expect("no valid actions but game not terminal");
         let action = E::Action::from_index(action_idx).expect("invalid action index");
+
+        // Record sample
+        samples.push(TrainingSample {
+            player,
+            notation,
+            policy,
+            value,
+        });
 
         // Apply action
         env.apply_action(action);
@@ -116,12 +124,11 @@ where
 ///
 /// For wins, the winner's moves get +1, loser's get -1.
 /// For draws, all moves get 0.
-fn backfill_values<E: Environment>(samples: &mut [TrainingSample<E>], outcome: TerminalState) {
+fn backfill_values(samples: &mut [TrainingSample], outcome: TerminalState) {
     for sample in samples.iter_mut() {
-        let player = sample.env.current_player();
         sample.value = match outcome {
             TerminalState::Win(winner) => {
-                if player == winner {
+                if sample.player == winner {
                     1.0
                 } else {
                     -1.0
@@ -162,9 +169,9 @@ pub async fn worker_loop<E, V, R>(
 
         // Push samples to replay buffer
         let mut guard = replay_buffer.reserve(num_samples);
-        guard.extend(game_samples.iter().map(|s| Sample {
-            notation: s.env.to_notation(),
-            policy: s.policy.clone(),
+        guard.extend(game_samples.into_iter().map(|s| Sample {
+            notation: s.notation,
+            policy: s.policy,
             value: s.value,
         }));
 
@@ -196,8 +203,7 @@ mod tests {
         };
 
         let rng = Rc::new(RefCell::new(ChaCha8Rng::seed_from_u64(42)));
-        let result: Rc<RefCell<Option<Vec<TrainingSample<TicTacToe>>>>> =
-            Rc::new(RefCell::new(None));
+        let result: Rc<RefCell<Option<Vec<TrainingSample>>>> = Rc::new(RefCell::new(None));
 
         let rng_clone = rng.clone();
         let result_clone = result.clone();
@@ -236,7 +242,8 @@ mod tests {
     #[test]
     fn test_backfill_values_win() {
         let mut samples = vec![TrainingSample {
-            env: TicTacToe::new(), // PlayerA to move
+            player: crate::Player::PlayerA,
+            notation: String::new(),
             policy: vec![],
             value: 0.0,
         }];
@@ -251,7 +258,8 @@ mod tests {
     #[test]
     fn test_backfill_values_draw() {
         let mut samples = vec![TrainingSample {
-            env: TicTacToe::new(),
+            player: crate::Player::PlayerA,
+            notation: String::new(),
             policy: vec![],
             value: 0.5, // Should be overwritten
         }];
