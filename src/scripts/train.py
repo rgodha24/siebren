@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -48,6 +48,7 @@ class TrainConfig:
     compile_mode: str = "reduce-overhead"
     compile_fullgraph: bool = False
     cudagraphs: bool = False
+    selfplay_backend: str = "python"
     inference_cuda_graph: bool = True
     selfplay_precision: str = "fp32"
     matmul_precision: str = "high"
@@ -522,14 +523,28 @@ def train(config: TrainConfig):
         )
         config.cudagraphs = False
 
-    model = maybe_compile_model(model, config)
-    execute_model = make_execute_model(
-        model,
-        config.device,
-        num_actions,
-        config.inference_cuda_graph,
-        config.selfplay_precision,
+    use_rust_cudagraph = (
+        config.selfplay_backend == "rust-cudagraph" and config.game == "bytefight"
     )
+    if config.selfplay_backend == "rust-cudagraph" and config.game != "bytefight":
+        print(
+            "Warning: rust-cudagraph backend currently supports only bytefight; "
+            "falling back to python callback backend."
+        )
+
+    model = maybe_compile_model(model, config)
+
+    execute_model: Optional[Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]] = (
+        None
+    )
+    if not use_rust_cudagraph:
+        execute_model = make_execute_model(
+            model,
+            config.device,
+            num_actions,
+            config.inference_cuda_graph,
+            config.selfplay_precision,
+        )
 
     # Track metrics
     total_games = 0
@@ -541,6 +556,7 @@ def train(config: TrainConfig):
     execute_model_time_sec = [0.0]
 
     def counting_execute_model(obs):
+        assert execute_model is not None
         batch_count[0] += 1
         start = time.perf_counter()
         out = execute_model(obs)
@@ -556,16 +572,27 @@ def train(config: TrainConfig):
         execute_model_time_sec[0] = 0.0
 
         selfplay_start = time.time()
-        selfplay_result = selfplay.play_games(
-            replay_buffer=replay_buffer,
-            num_samples=config.samples_per_epoch,
-            execute_model=counting_execute_model,
-        )
+        if use_rust_cudagraph:
+            selfplay_result = selfplay.play_games(
+                replay_buffer=replay_buffer,
+                num_samples=config.samples_per_epoch,
+                execute_model=None,
+                use_rust_cudagraph=True,
+                model=model,
+                selfplay_precision=config.selfplay_precision,
+            )
+        else:
+            selfplay_result = selfplay.play_games(
+                replay_buffer=replay_buffer,
+                num_samples=config.samples_per_epoch,
+                execute_model=counting_execute_model,
+            )
         games_completed, samples_collected, executor_stats = selfplay_result
         selfplay_time = time.time() - selfplay_start
+        dispatch_batches = int(executor_stats.get("batches_dispatched", batch_count[0]))
 
         total_games += games_completed
-        total_batches += batch_count[0]
+        total_batches += dispatch_batches
 
         moves_per_game = (
             samples_collected / games_completed if games_completed > 0 else 0.0
@@ -577,20 +604,21 @@ def train(config: TrainConfig):
             "selfplay/games_completed": games_completed,
             "selfplay/samples_collected": samples_collected,
             "selfplay/moves_per_game": moves_per_game,
-            "selfplay/batches": batch_count[0],
+            "selfplay/batches": dispatch_batches,
             "selfplay/time_sec": selfplay_time,
             "selfplay/games_per_sec": games_completed / selfplay_time,
             "selfplay/samples_per_sec": samples_collected / selfplay_time,
-            "selfplay/batches_per_sec": batch_count[0] / selfplay_time,
+            "selfplay/batches_per_sec": dispatch_batches / selfplay_time,
             "selfplay/execute_model_time_sec": execute_model_time_sec[0],
             "selfplay/execute_model_time_per_batch_ms": (
-                1000.0 * execute_model_time_sec[0] / batch_count[0]
-                if batch_count[0] > 0
+                1000.0 * execute_model_time_sec[0] / dispatch_batches
+                if dispatch_batches > 0
                 else 0.0
             ),
             "selfplay/execute_model_fraction": (
                 execute_model_time_sec[0] / selfplay_time if selfplay_time > 0 else 0.0
             ),
+            "selfplay/backend": config.selfplay_backend,
             "selfplay/executor_poll_rounds": executor_stats["poll_rounds"],
             "selfplay/executor_futures_polled": executor_stats["futures_polled"],
             "selfplay/executor_poll_ready": executor_stats["poll_ready"],
@@ -766,6 +794,13 @@ def main():
         help="Enable inductor cudagraphs (requires --compile)",
     )
     parser.add_argument(
+        "--selfplay-backend",
+        type=str,
+        default="python",
+        choices=["python", "rust-cudagraph"],
+        help="Self-play inference backend",
+    )
+    parser.add_argument(
         "--inference-cuda-graph",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -810,6 +845,7 @@ def main():
         compile_mode=args.compile_mode,
         compile_fullgraph=args.compile_fullgraph,
         cudagraphs=args.cudagraphs,
+        selfplay_backend=args.selfplay_backend,
         inference_cuda_graph=args.inference_cuda_graph,
         selfplay_precision=args.selfplay_precision,
         matmul_precision=args.matmul_precision,

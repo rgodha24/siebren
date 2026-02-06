@@ -1,5 +1,5 @@
 import importlib
-from typing import Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -36,19 +36,40 @@ class SelfPlay:
         self,
         replay_buffer: ReplayBuffer,
         num_samples: int,
-        execute_model: Callable[
-            [npt.NDArray[np.generic]],
-            Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
-        ],
+        execute_model: Optional[
+            Callable[
+                [npt.NDArray[np.generic]],
+                Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
+            ]
+        ] = None,
+        *,
+        use_rust_cudagraph: bool = False,
+        model: Optional[Any] = None,
+        selfplay_precision: str = "fp32",
     ) -> Tuple[int, int, Dict[str, int]]:
         """Run self-play games and return (games_completed, samples_collected, executor_counters)."""
         assert replay_buffer.game == self.game
         assert isinstance(replay_buffer, EphemeralReplayBuffer)
 
+        if self.game == "bytefight":
+            return _native.selfplay_bytefight_ephemeral(
+                replay_buffer._inner,
+                self.num_threads,
+                self.workers_per_thread,
+                num_samples,
+                self.seed,
+                execute_model,
+                use_rust_cudagraph=use_rust_cudagraph,
+                model=model,
+                selfplay_precision=selfplay_precision,
+            )
+
+        if execute_model is None:
+            raise ValueError("execute_model callback is required for this game")
+
         fn = {
             "tictactoe": _native.selfplay_tictactoe_ephemeral,
             "connect4": _native.selfplay_connect4_ephemeral,
-            "bytefight": _native.selfplay_bytefight_ephemeral,
         }[self.game]
 
         return fn(
