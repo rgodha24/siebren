@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,8 @@ class TrainConfig:
     compile_mode: str = "reduce-overhead"
     compile_fullgraph: bool = False
     cudagraphs: bool = False
+    inference_cuda_graph: bool = True
+    selfplay_precision: str = "fp32"
     matmul_precision: str = "high"
 
 
@@ -151,12 +154,10 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     config: TrainConfig,
-    replay_buffer: EphemeralReplayBuffer,
+    _replay_buffer: EphemeralReplayBuffer,
     checkpoint_dir: Path,
 ) -> None:
-    # this shit uses SO MUCH STORAGE we dont need it
-    return
-    """Save model and training state."""
+    """Save model and optimizer state."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = {
@@ -174,12 +175,7 @@ def save_checkpoint(
     latest = checkpoint_dir / "latest.pt"
     torch.save(checkpoint, latest)
 
-    # Save replay buffer (only unsaved samples)
-    buffer_path = checkpoint_dir / f"replay_buffer_epoch{epoch:04d}.bin"
-    samples_saved = replay_buffer.save(str(buffer_path), epoch)
-    replay_buffer.mark_saved()
-
-    print(f"Saved checkpoint to {path} ({samples_saved} new samples)")
+    print(f"Saved checkpoint to {path}")
 
 
 def load_checkpoint(
@@ -203,12 +199,35 @@ def load_checkpoint(
     return checkpoint["epoch"]
 
 
-def make_execute_model(model: nn.Module, device: str, num_actions: int):
+def make_execute_model(
+    model: nn.Module,
+    device: str,
+    num_actions: int,
+    use_inference_cuda_graph: bool,
+    selfplay_precision: str,
+):
     """Create the execute_model callback for self-play.
 
     The callback is called from Rust with batched observations.
     It runs inference and returns (policy, value) numpy arrays.
     """
+
+    autocast_dtype: Optional[torch.dtype] = None
+    if device.startswith("cuda"):
+        if selfplay_precision == "fp16":
+            autocast_dtype = torch.float16
+        elif selfplay_precision == "bf16":
+            if torch.cuda.is_bf16_supported():
+                autocast_dtype = torch.bfloat16
+            else:
+                print("Warning: bf16 autocast unsupported; falling back to fp16.")
+                autocast_dtype = torch.float16
+
+    def model_forward(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if autocast_dtype is None:
+            return model(x)
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            return model(x)
 
     @torch.inference_mode()
     def execute_model(
@@ -216,7 +235,7 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
     ) -> Tuple[np.ndarray, np.ndarray]:
         # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4, (256, 18) for ByteFight
         x = torch.from_numpy(obs).to(device)
-        policy_logits, value = model(x)
+        policy_logits, value = model_forward(x)
 
         # Softmax policy and convert to numpy
         policy = F.softmax(policy_logits, dim=-1).cpu().numpy()
@@ -224,7 +243,115 @@ def make_execute_model(model: nn.Module, device: str, num_actions: int):
 
         return policy, value
 
-    return execute_model
+    if not (use_inference_cuda_graph and device.startswith("cuda")):
+        return execute_model
+
+    callback_lock = threading.Lock()
+
+    graph_state: Dict[str, object] = {
+        "ready": False,
+        "shape": None,
+        "fallback": False,
+    }
+
+    @torch.inference_mode()
+    def execute_model_cuda_graph(
+        obs: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        with callback_lock:
+            if graph_state["fallback"]:
+                return execute_model(obs)
+
+            try:
+                obs_shape = obs.shape
+                if (not graph_state["ready"]) or graph_state["shape"] != obs_shape:
+                    src = torch.from_numpy(obs)
+                    device_obs = torch.empty_like(src, device=device)
+                    device_policy = torch.empty(
+                        (obs_shape[0], num_actions), dtype=torch.float32, device=device
+                    )
+                    device_value = torch.empty(
+                        (obs_shape[0],), dtype=torch.float32, device=device
+                    )
+
+                    host_policy = torch.empty(
+                        (obs_shape[0], num_actions),
+                        dtype=torch.float32,
+                        pin_memory=True,
+                    )
+                    host_value = torch.empty(
+                        (obs_shape[0],), dtype=torch.float32, pin_memory=True
+                    )
+                    host_obs = torch.empty_like(src, pin_memory=True)
+
+                    warmup_stream = torch.cuda.Stream()
+                    warmup_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(warmup_stream):
+                        for _ in range(5):
+                            logits, value = model_forward(device_obs)
+                            device_policy.copy_(F.softmax(logits, dim=-1))
+                            device_value.copy_(value)
+                    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        logits, value = model_forward(device_obs)
+                        device_policy.copy_(F.softmax(logits, dim=-1))
+                        device_value.copy_(value)
+
+                    graph_state.update(
+                        {
+                            "ready": True,
+                            "shape": obs_shape,
+                            "device_obs": device_obs,
+                            "device_policy": device_policy,
+                            "device_value": device_value,
+                            "host_policy": host_policy,
+                            "host_value": host_value,
+                            "host_obs": host_obs,
+                            "policy_np": host_policy.numpy(),
+                            "value_np": host_value.numpy(),
+                            "graph": graph,
+                        }
+                    )
+
+                device_obs = graph_state["device_obs"]
+                device_policy = graph_state["device_policy"]
+                device_value = graph_state["device_value"]
+                host_policy = graph_state["host_policy"]
+                host_value = graph_state["host_value"]
+                host_obs = graph_state["host_obs"]
+                policy_np = graph_state["policy_np"]
+                value_np = graph_state["value_np"]
+                graph = graph_state["graph"]
+
+                assert isinstance(device_obs, torch.Tensor)
+                assert isinstance(device_policy, torch.Tensor)
+                assert isinstance(device_value, torch.Tensor)
+                assert isinstance(host_policy, torch.Tensor)
+                assert isinstance(host_value, torch.Tensor)
+                assert isinstance(host_obs, torch.Tensor)
+                assert isinstance(policy_np, np.ndarray)
+                assert isinstance(value_np, np.ndarray)
+                assert isinstance(graph, torch.cuda.CUDAGraph)
+
+                host_obs.copy_(torch.from_numpy(obs), non_blocking=False)
+                device_obs.copy_(host_obs, non_blocking=True)
+                graph.replay()
+                host_policy.copy_(device_policy, non_blocking=True)
+                host_value.copy_(device_value, non_blocking=True)
+                torch.cuda.current_stream().synchronize()
+
+                return policy_np, value_np
+            except Exception as exc:
+                print(
+                    f"Warning: inference CUDA graph failed ({exc}); "
+                    "falling back to eager callback."
+                )
+                graph_state["fallback"] = True
+                return execute_model(obs)
+
+    return execute_model_cuda_graph
 
 
 def configure_torch(config: TrainConfig) -> None:
@@ -322,12 +449,20 @@ def train_step(
 
 def train(config: TrainConfig):
     """Main training loop."""
+    default_run_name = f"{config.game}-{time.strftime('%Y%m%d-%H%M%S')}"
+
     # Initialize wandb
-    wandb.init(
+    run = wandb.init(
         project=config.wandb_project,
         config=vars(config),
-        name=f"{config.game}-{time.strftime('%Y%m%d-%H%M%S')}",
+        name=default_run_name,
     )
+
+    run_name = run.name if run is not None and run.name else default_run_name
+    checkpoint_run_name = "".join(
+        ch if (ch.isalnum() or ch in "-_.") else "_" for ch in run_name
+    )
+    checkpoint_run_name = checkpoint_run_name.strip("._") or "run"
 
     configure_torch(config)
 
@@ -358,7 +493,7 @@ def train(config: TrainConfig):
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
 
     # Setup checkpoint directory
-    checkpoint_dir = Path(config.checkpoint_dir)
+    checkpoint_dir = Path(config.checkpoint_dir) / checkpoint_run_name
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -388,7 +523,13 @@ def train(config: TrainConfig):
         config.cudagraphs = False
 
     model = maybe_compile_model(model, config)
-    execute_model = make_execute_model(model, config.device, num_actions)
+    execute_model = make_execute_model(
+        model,
+        config.device,
+        num_actions,
+        config.inference_cuda_graph,
+        config.selfplay_precision,
+    )
 
     # Track metrics
     total_games = 0
@@ -397,10 +538,14 @@ def train(config: TrainConfig):
 
     # Batch counter - reused across epochs to avoid creating new closures
     batch_count = [0]
+    execute_model_time_sec = [0.0]
 
     def counting_execute_model(obs):
         batch_count[0] += 1
-        return execute_model(obs)
+        start = time.perf_counter()
+        out = execute_model(obs)
+        execute_model_time_sec[0] += time.perf_counter() - start
+        return out
 
     for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
@@ -408,6 +553,7 @@ def train(config: TrainConfig):
         # Self-play phase
         model.eval()
         batch_count[0] = 0  # Reset counter for this epoch
+        execute_model_time_sec[0] = 0.0
 
         selfplay_start = time.time()
         selfplay_result = selfplay.play_games(
@@ -436,6 +582,15 @@ def train(config: TrainConfig):
             "selfplay/games_per_sec": games_completed / selfplay_time,
             "selfplay/samples_per_sec": samples_collected / selfplay_time,
             "selfplay/batches_per_sec": batch_count[0] / selfplay_time,
+            "selfplay/execute_model_time_sec": execute_model_time_sec[0],
+            "selfplay/execute_model_time_per_batch_ms": (
+                1000.0 * execute_model_time_sec[0] / batch_count[0]
+                if batch_count[0] > 0
+                else 0.0
+            ),
+            "selfplay/execute_model_fraction": (
+                execute_model_time_sec[0] / selfplay_time if selfplay_time > 0 else 0.0
+            ),
             "selfplay/executor_poll_rounds": executor_stats["poll_rounds"],
             "selfplay/executor_futures_polled": executor_stats["futures_polled"],
             "selfplay/executor_poll_ready": executor_stats["poll_ready"],
@@ -611,6 +766,19 @@ def main():
         help="Enable inductor cudagraphs (requires --compile)",
     )
     parser.add_argument(
+        "--inference-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use explicit CUDA graph replay in self-play execute_model callback",
+    )
+    parser.add_argument(
+        "--selfplay-precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Precision for self-play model inference",
+    )
+    parser.add_argument(
         "--matmul-precision",
         type=str,
         default="high",
@@ -642,6 +810,8 @@ def main():
         compile_mode=args.compile_mode,
         compile_fullgraph=args.compile_fullgraph,
         cudagraphs=args.cudagraphs,
+        inference_cuda_graph=args.inference_cuda_graph,
+        selfplay_precision=args.selfplay_precision,
         matmul_precision=args.matmul_precision,
     )
 
