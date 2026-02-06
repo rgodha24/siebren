@@ -97,8 +97,8 @@ impl ExecutorCountersAtomic {
 /// async workers. All workers share a single GPU job queue for batched inference.
 ///
 /// The `dispatch` callback is called when a batch of observations is ready
-/// for GPU inference. It receives a zero-copy view of the batched observations
-/// and should fill the output policy/value pairs.
+/// for GPU inference. It receives the queue batch slot index, a zero-copy view
+/// of the batched observations, and should fill the output policy/value pairs.
 ///
 /// Workers share an atomic counter for samples collected. When the target is
 /// reached, remaining workers are cancelled via the executor. This allows
@@ -114,6 +114,7 @@ where
     E: Environment + Clone + Send + 'static,
     E::ObsDim: BatchDim,
     F: Fn(
+            usize,
             ArrayView<E::ObsElem, <E::ObsDim as BatchDim>::BatchedDim>,
             &mut [PolicyValue<NUM_ACTIONS>],
         ) + Send

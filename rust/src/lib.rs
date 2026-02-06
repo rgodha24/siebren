@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{fmt::Debug, hash::Hash};
 
@@ -67,6 +68,7 @@ impl BatchDim for Ix5 {
     }
 }
 
+pub mod cudagraph;
 pub mod environments;
 pub mod eval;
 pub mod executor;
@@ -231,7 +233,9 @@ fn selfplay_tictactoe_ephemeral(
         worker: WorkerConfig::default(),
     };
 
-    let dispatch = move |obs_view: ArrayView<i8, Ix2>, outputs: &mut [PolicyValue<9>]| {
+    let dispatch = move |_batch_idx: usize,
+                         obs_view: ArrayView<i8, Ix2>,
+                         outputs: &mut [PolicyValue<9>]| {
         Python::attach(|py| {
             // Zero-copy numpy array from obs_view
             // SAFETY: obs_view is valid for the duration of this callback,
@@ -311,7 +315,9 @@ fn selfplay_connect4_ephemeral(
         worker: WorkerConfig::default(),
     };
 
-    let dispatch = move |obs_view: ArrayView<i8, Ix3>, outputs: &mut [PolicyValue<7>]| {
+    let dispatch = move |_batch_idx: usize,
+                         obs_view: ArrayView<i8, Ix3>,
+                         outputs: &mut [PolicyValue<7>]| {
         Python::attach(|py| {
             // Zero-copy numpy array from obs_view
             // SAFETY: obs_view is valid for the duration of this callback,
@@ -369,7 +375,18 @@ fn selfplay_connect4_ephemeral(
 ///   Actions: 0-7 = directions (N,NE,E,SE,S,SW,W,NW), 8=Trap, 9=FF, 10=EndTurn
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
-#[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
+#[pyo3(signature = (
+    replay_buffer,
+    num_threads,
+    workers_per_thread,
+    target_samples,
+    seed,
+    execute_model = None,
+    *,
+    use_rust_cudagraph = false,
+    model = None,
+    selfplay_precision = "fp32"
+))]
 fn selfplay_bytefight_ephemeral(
     py: Python<'_>,
     replay_buffer: &ByteFightEphemeralReplayBuffer,
@@ -377,9 +394,14 @@ fn selfplay_bytefight_ephemeral(
     workers_per_thread: usize,
     target_samples: usize,
     seed: u64,
-    execute_model: Py<PyAny>,
+    execute_model: Option<Py<PyAny>>,
+    use_rust_cudagraph: bool,
+    model: Option<Py<PyAny>>,
+    selfplay_precision: &str,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
+    use cudagraph::ByteFightCudaGraphRunner;
     use eval::PolicyValue;
+    use queue::{queue_shape_for_workers, BATCH_SIZE};
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
 
@@ -391,39 +413,81 @@ fn selfplay_bytefight_ephemeral(
         worker: WorkerConfig::default(),
     };
 
-    let dispatch = move |obs_view: ArrayView<f32, Ix2>, outputs: &mut [PolicyValue<11>]| {
-        Python::attach(|py| {
-            // Zero-copy numpy array from obs_view
-            // SAFETY: obs_view is valid for the duration of this callback,
-            // and the numpy array doesn't escape the callback scope.
-            let np_obs = unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
+    let batches_dispatched = Arc::new(AtomicUsize::new(0));
 
-            // Call Python: (BATCH_SIZE, 18) -> ((BATCH_SIZE, 11), (BATCH_SIZE,))
-            let result = execute_model
-                .call1(py, (np_obs,))
-                .expect("execute_model call failed");
+    let result = if use_rust_cudagraph {
+        let model = model.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "model is required when use_rust_cudagraph=True",
+            )
+        })?;
+        let total_workers = num_threads.checked_mul(workers_per_thread).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "num_threads * workers_per_thread overflow",
+            )
+        })?;
+        let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
+        let runner = Arc::new(ByteFightCudaGraphRunner::new(
+            py,
+            model,
+            num_batches,
+            BATCH_SIZE,
+            selfplay_precision,
+        )?);
 
-            let (policy_arr, value_arr): (
-                Bound<'_, PyArray<f32, Ix2>>,
-                Bound<'_, PyArray<f32, Ix1>>,
-            ) = result
-                .extract(py)
-                .expect("expected (policy, value) tuple of numpy arrays");
+        let batches_dispatched_ref = batches_dispatched.clone();
+        let dispatch = move |batch_idx: usize,
+                             obs_view: ArrayView<f32, Ix2>,
+                             outputs: &mut [PolicyValue<11>]| {
+            batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
+            runner.dispatch(batch_idx, obs_view, outputs);
+        };
 
-            // Copy results back to PolicyValue outputs
-            let policy = unsafe { policy_arr.as_slice().unwrap() };
-            let value = unsafe { value_arr.as_slice().unwrap() };
+        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch))
+    } else {
+        let execute_model = execute_model.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "execute_model is required when use_rust_cudagraph=False",
+            )
+        })?;
+        let batches_dispatched_ref = batches_dispatched.clone();
+        let dispatch = move |_batch_idx: usize,
+                             obs_view: ArrayView<f32, Ix2>,
+                             outputs: &mut [PolicyValue<11>]| {
+            batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
+            Python::attach(|py| {
+                // Zero-copy numpy array from obs_view
+                // SAFETY: obs_view is valid for the duration of this callback,
+                // and the numpy array doesn't escape the callback scope.
+                let np_obs =
+                    unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
 
-            for (i, out) in outputs.iter_mut().enumerate() {
-                out.policy.copy_from_slice(&policy[i * 11..(i + 1) * 11]);
-                out.value = value[i];
-            }
-        });
+                // Call Python: (BATCH_SIZE, 18) -> ((BATCH_SIZE, 11), (BATCH_SIZE,))
+                let result = execute_model
+                    .call1(py, (np_obs,))
+                    .expect("execute_model call failed");
+
+                let (policy_arr, value_arr): (
+                    Bound<'_, PyArray<f32, Ix2>>,
+                    Bound<'_, PyArray<f32, Ix1>>,
+                ) = result
+                    .extract(py)
+                    .expect("expected (policy, value) tuple of numpy arrays");
+
+                // Copy results back to PolicyValue outputs
+                let policy = unsafe { policy_arr.as_slice().unwrap() };
+                let value = unsafe { value_arr.as_slice().unwrap() };
+
+                for (i, out) in outputs.iter_mut().enumerate() {
+                    out.policy.copy_from_slice(&policy[i * 11..(i + 1) * 11]);
+                    out.value = value[i];
+                }
+            });
+        };
+
+        // Release GIL while running training, reacquire in dispatch callback.
+        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch))
     };
-
-    // Release GIL while running training, reacquire in dispatch callback
-    let result =
-        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch));
 
     let stats = PyDict::new(py);
     stats.set_item("poll_rounds", result.executor.poll_rounds)?;
@@ -431,6 +495,10 @@ fn selfplay_bytefight_ephemeral(
     stats.set_item("poll_ready", result.executor.poll_ready)?;
     stats.set_item("poll_pending", result.executor.poll_pending)?;
     stats.set_item("wait_count", result.executor.wait_count)?;
+    stats.set_item(
+        "batches_dispatched",
+        batches_dispatched.load(Ordering::Relaxed),
+    )?;
 
     Ok((
         result.games_completed,

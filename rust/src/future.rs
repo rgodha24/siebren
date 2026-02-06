@@ -143,7 +143,7 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            move |inputs, outputs| {
+            move |_batch_idx, inputs, outputs| {
                 submit_count_clone.fetch_add(1, Ordering::SeqCst);
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
@@ -175,12 +175,15 @@ mod tests {
 
     #[test]
     fn test_future_returns_correct_result() {
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            BATCH_SIZE,
+            |_batch_idx, inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input + 100;
                 }
-            }));
+            },
+        ));
 
         let mut futures: Vec<_> = (0..BATCH_SIZE as u64)
             .map(|i| queue.eval(|mut out| out[()] = i))
@@ -202,12 +205,15 @@ mod tests {
 
     #[test]
     fn test_progress_tracking() {
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            BATCH_SIZE,
+            |_batch_idx, inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = *input;
                 }
-            }));
+            },
+        ));
 
         // Clear any previous progress
         take_progress();

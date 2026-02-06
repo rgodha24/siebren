@@ -24,6 +24,18 @@ pub const BATCH_SIZE: usize = 256;
 
 const SLOT_MULTIPLIER: usize = 2;
 
+/// Compute queue shape for a given worker count.
+///
+/// Returns `(num_batches, total_slots)` where `total_slots` is rounded up to a
+/// whole number of `BATCH_SIZE` lanes and is at least `2 * num_workers`.
+pub fn queue_shape_for_workers(num_workers: usize) -> (usize, usize) {
+    assert!(num_workers > 0, "num_workers must be > 0");
+    let min_slots = num_workers.saturating_mul(SLOT_MULTIPLIER).max(BATCH_SIZE);
+    let num_batches = min_slots.div_ceil(BATCH_SIZE);
+    let total_slots = num_batches * BATCH_SIZE;
+    (num_batches, total_slots)
+}
+
 /// A lock-free queue for batching GPU inference jobs.
 ///
 /// Workers submit observations via callback and receive tickets. When a batch fills,
@@ -61,8 +73,8 @@ where
     completion_event: Event,
 
     /// Callback invoked when a batch is ready.
-    /// Receives a view of the batch observations and should fill outputs.
-    dispatch: Box<dyn Fn(ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync>,
+    /// Receives the batch slot index, a view of batch observations, and should fill outputs.
+    dispatch: Box<dyn Fn(usize, ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync>,
 }
 
 // SAFETY: The queue is designed for concurrent access:
@@ -92,11 +104,7 @@ where
     O: Copy + Default + Send + Sync,
 {
     fn compute_queue_shape(num_workers: usize) -> (usize, usize) {
-        assert!(num_workers > 0, "num_workers must be > 0");
-        let min_slots = num_workers.saturating_mul(SLOT_MULTIPLIER).max(BATCH_SIZE);
-        let num_batches = min_slots.div_ceil(BATCH_SIZE);
-        let total_slots = num_batches * BATCH_SIZE;
-        (num_batches, total_slots)
+        queue_shape_for_workers(num_workers)
     }
 
     /// Creates a new job queue with the given observation shape, worker count,
@@ -110,7 +118,7 @@ where
     /// and should fill the outputs.
     pub fn new<F>(obs_shape: D, num_workers: usize, dispatch: F) -> Self
     where
-        F: Fn(ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync + 'static,
+        F: Fn(usize, ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync + 'static,
     {
         let (num_batches, total_slots) = Self::compute_queue_shape(num_workers);
 
@@ -198,7 +206,7 @@ where
 
         let mut outputs: Vec<O> = vec![O::default(); BATCH_SIZE];
 
-        (self.dispatch)(batch_view, &mut outputs);
+        (self.dispatch)(batch_idx, batch_view, &mut outputs);
 
         // SAFETY: We're the only one writing outputs for this batch
         for (i, output) in outputs.into_iter().enumerate() {
@@ -258,13 +266,16 @@ mod tests {
     #[test]
     fn test_single_batch_completion() {
         // Use Ix0 (scalar) for simple tests
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            BATCH_SIZE,
+            |_batch_idx, inputs, outputs| {
                 // Simple transform: output = input * 2
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
-            }));
+            },
+        ));
 
         // Submit BATCH_SIZE jobs
         let tickets: Vec<u64> = (0..BATCH_SIZE as u64)
@@ -281,12 +292,15 @@ mod tests {
 
     #[test]
     fn test_partial_batch_not_ready() {
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            BATCH_SIZE,
+            |_batch_idx, inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
-            }));
+            },
+        ));
 
         // Submit less than a full batch
         let tickets: Vec<u64> = (0..BATCH_SIZE as u64 - 1)
@@ -316,12 +330,15 @@ mod tests {
     #[test]
     fn test_multiple_batches() {
         let num_jobs = BATCH_SIZE * 3;
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), num_jobs, |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            num_jobs,
+            |_batch_idx, inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input + 1000;
                 }
-            }));
+            },
+        ));
 
         // Submit 3 full batches
         let all_tickets: Vec<u64> = (0..num_jobs as u64)
@@ -337,12 +354,15 @@ mod tests {
 
     #[test]
     fn test_batch_slot_reuse() {
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            BATCH_SIZE,
+            |_batch_idx, inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = *input;
                 }
-            }));
+            },
+        ));
 
         let total_slots = queue.total_slots();
 
@@ -390,7 +410,7 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             num_threads * jobs_per_thread,
-            |inputs, outputs| {
+            |_batch_idx, inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }

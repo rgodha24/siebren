@@ -31,7 +31,7 @@ mod tests {
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             BATCH_SIZE,
-            move |_inputs, outputs: &mut [Output]| {
+            move |_batch_idx, _inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
@@ -83,7 +83,7 @@ mod tests {
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             num_evals,
-            move |_inputs, outputs: &mut [Output]| {
+            move |_batch_idx, _inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
@@ -133,7 +133,7 @@ mod tests {
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             num_searches,
-            move |_inputs, outputs: &mut [Output]| {
+            move |_batch_idx, _inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
