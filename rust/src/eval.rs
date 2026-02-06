@@ -206,6 +206,7 @@ mod tests {
         type Output = PolicyValue<{ TicTacToe::NUM_ACTIONS }>;
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
+            BATCH_SIZE,
             |_inputs, outputs: &mut [Output]| {
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];

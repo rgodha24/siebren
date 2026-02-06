@@ -128,8 +128,13 @@ where
     let executor_counters = Arc::new(ExecutorCountersAtomic::default());
 
     // Create shared GPU queue with observation shape
+    let total_workers = config
+        .num_threads
+        .checked_mul(config.workers_per_thread)
+        .expect("num_threads * workers_per_thread overflowed usize");
+
     let queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>> =
-        Arc::new(GpuJobQueue::new(E::OBS_SHAPE, dispatch));
+        Arc::new(GpuJobQueue::new(E::OBS_SHAPE, total_workers, dispatch));
 
     // Use scoped threads to allow borrowing replay_buffer across threads
     thread::scope(|s| {

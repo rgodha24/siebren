@@ -1,9 +1,10 @@
 //! Lock-free GPU job queue for batching inference requests.
 //!
 //! Uses atomic fetch_add for slot assignment and batch completion tracking.
-//! Designed for 512 workers (32 threads x 16 workers) submitting to batches of 256.
+//! Queue storage is sized from worker count at construction time.
 //!
-//! Observations are stored in a single contiguous array with shape (TOTAL_SLOTS, ...obs_shape).
+//! Observations are stored in a single contiguous array with shape
+//! `(total_slots, ...obs_shape)`.
 //! This enables zero-copy batch slicing for GPU dispatch.
 
 use std::cell::UnsafeCell;
@@ -21,8 +22,7 @@ pub const BATCH_SIZE: usize = 16;
 #[cfg(not(test))]
 pub const BATCH_SIZE: usize = 256;
 
-pub const NUM_BATCHES: usize = 8;
-pub const TOTAL_SLOTS: usize = BATCH_SIZE * NUM_BATCHES;
+const SLOT_MULTIPLIER: usize = 2;
 
 /// A lock-free queue for batching GPU inference jobs.
 ///
@@ -38,17 +38,23 @@ where
     write_ticket: AtomicU64,
     /// Count of completed writes per batch slot.
     /// When this reaches BATCH_SIZE, the batch is ready for GPU dispatch.
-    batch_writes: [AtomicU64; NUM_BATCHES],
+    batch_writes: Box<[AtomicU64]>,
 
     /// Ticket number at which each batch was completed (end of batch).
     /// Workers check this to know if their result is ready.
-    batch_complete: [AtomicU64; NUM_BATCHES],
+    batch_complete: Box<[AtomicU64]>,
 
-    /// Observation storage: shape is (TOTAL_SLOTS, ...obs_shape).
+    /// Number of batch slots in the ring.
+    num_batches: usize,
+
+    /// Total number of observation/output slots.
+    total_slots: usize,
+
+    /// Observation storage: shape is `(total_slots, ...obs_shape)`.
     /// Single contiguous allocation for zero-copy batch slicing.
     observations: UnsafeCell<Array<A, D::BatchedDim>>,
 
-    /// Output buffer. Size = TOTAL_SLOTS.
+    /// Output buffer. Size = `total_slots`.
     outputs: Box<[UnsafeCell<O>]>,
 
     /// Event for parking threads when waiting for GPU completion.
@@ -85,32 +91,61 @@ where
     D: BatchDim,
     O: Copy + Default + Send + Sync,
 {
-    /// Creates a new job queue with the given observation shape and dispatch callback.
+    fn compute_queue_shape(num_workers: usize) -> (usize, usize) {
+        assert!(num_workers > 0, "num_workers must be > 0");
+        let min_slots = num_workers.saturating_mul(SLOT_MULTIPLIER).max(BATCH_SIZE);
+        let num_batches = min_slots.div_ceil(BATCH_SIZE);
+        let total_slots = num_batches * BATCH_SIZE;
+        (num_batches, total_slots)
+    }
+
+    /// Creates a new job queue with the given observation shape, worker count,
+    /// and dispatch callback.
+    ///
+    /// Queue storage is provisioned to at least `2 * num_workers` slots,
+    /// rounded up to a whole number of batches.
     ///
     /// The callback is invoked when a batch of BATCH_SIZE jobs is ready.
     /// It receives a view of the batch observations (shape: BATCH_SIZE x obs_shape)
     /// and should fill the outputs.
-    pub fn new<F>(obs_shape: D, dispatch: F) -> Self
+    pub fn new<F>(obs_shape: D, num_workers: usize, dispatch: F) -> Self
     where
         F: Fn(ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync + 'static,
     {
-        // Build the batched shape: (TOTAL_SLOTS, ...obs_shape)
-        let full_shape = D::with_batch(TOTAL_SLOTS, obs_shape);
+        let (num_batches, total_slots) = Self::compute_queue_shape(num_workers);
+
+        // Build the batched shape: `(total_slots, ...obs_shape)`
+        let full_shape = D::with_batch(total_slots, obs_shape);
         let observations = Array::default(full_shape);
 
-        let outputs: Box<[UnsafeCell<O>]> = (0..TOTAL_SLOTS)
+        let outputs: Box<[UnsafeCell<O>]> = (0..total_slots)
             .map(|_| UnsafeCell::new(O::default()))
             .collect();
 
+        let batch_writes = (0..num_batches).map(|_| AtomicU64::new(0)).collect();
+        let batch_complete = (0..num_batches).map(|_| AtomicU64::new(0)).collect();
+
         Self {
             write_ticket: AtomicU64::new(0),
-            batch_writes: std::array::from_fn(|_| AtomicU64::new(0)),
-            batch_complete: std::array::from_fn(|_| AtomicU64::new(0)),
+            batch_writes,
+            batch_complete,
+            num_batches,
+            total_slots,
             observations: UnsafeCell::new(observations),
             outputs,
             completion_event: Event::new(),
             dispatch: Box::new(dispatch),
         }
+    }
+
+    #[inline]
+    pub fn num_batches(&self) -> usize {
+        self.num_batches
+    }
+
+    #[inline]
+    pub fn total_slots(&self) -> usize {
+        self.total_slots
     }
 
     /// Submit a job by writing an observation via callback.
@@ -126,8 +161,8 @@ where
     {
         // Claim a slot
         let ticket = self.write_ticket.fetch_add(1, Ordering::Relaxed);
-        let slot_idx = (ticket as usize) % TOTAL_SLOTS;
-        let batch_idx = ((ticket as usize) / BATCH_SIZE) % NUM_BATCHES;
+        let slot_idx = (ticket as usize) % self.total_slots;
+        let batch_idx = ((ticket as usize) / BATCH_SIZE) % self.num_batches;
 
         // Get mutable view of our slot and let caller write the observation
         // SAFETY: We own this slot exclusively until we increment batch_writes
@@ -188,7 +223,7 @@ where
 
     /// Poll for a result. Returns Some(&O) if ready, None if still pending.
     pub fn poll(&self, ticket: u64) -> Option<&O> {
-        let batch_idx = ((ticket as usize) / BATCH_SIZE) % NUM_BATCHES;
+        let batch_idx = ((ticket as usize) / BATCH_SIZE) % self.num_batches;
         let batch_end_ticket = ((ticket / BATCH_SIZE as u64) + 1) * BATCH_SIZE as u64;
 
         // Check if this batch is complete
@@ -197,7 +232,7 @@ where
         }
 
         // Batch is complete, return reference to output
-        let slot_idx = (ticket as usize) % TOTAL_SLOTS;
+        let slot_idx = (ticket as usize) % self.total_slots;
         // SAFETY: batch_complete >= batch_end_ticket means output is written and won't change
         Some(unsafe { &*self.outputs[slot_idx].get() })
     }
@@ -224,7 +259,7 @@ mod tests {
     fn test_single_batch_completion() {
         // Use Ix0 (scalar) for simple tests
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
                 // Simple transform: output = input * 2
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
@@ -247,7 +282,7 @@ mod tests {
     #[test]
     fn test_partial_batch_not_ready() {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
@@ -280,15 +315,16 @@ mod tests {
 
     #[test]
     fn test_multiple_batches() {
+        let num_jobs = BATCH_SIZE * 3;
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+            Arc::new(GpuJobQueue::new(Ix0(), num_jobs, |inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input + 1000;
                 }
             }));
 
         // Submit 3 full batches
-        let all_tickets: Vec<u64> = (0..(BATCH_SIZE * 3) as u64)
+        let all_tickets: Vec<u64> = (0..num_jobs as u64)
             .map(|i| queue.submit(|mut out| out[()] = i))
             .collect();
 
@@ -302,14 +338,16 @@ mod tests {
     #[test]
     fn test_batch_slot_reuse() {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
+            Arc::new(GpuJobQueue::new(Ix0(), BATCH_SIZE, |inputs, outputs| {
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = *input;
                 }
             }));
 
-        // Submit exactly NUM_BATCHES batches (fills all slots)
-        let tickets_round1: Vec<u64> = (0..TOTAL_SLOTS as u64)
+        let total_slots = queue.total_slots();
+
+        // Submit exactly enough jobs to fill every slot once.
+        let tickets_round1: Vec<u64> = (0..total_slots as u64)
             .map(|i| queue.submit(|mut out| out[()] = i))
             .collect();
 
@@ -324,13 +362,13 @@ mod tests {
         }
 
         // Now submit another round (reusing slots)
-        let tickets_round2: Vec<u64> = (TOTAL_SLOTS as u64..(TOTAL_SLOTS * 2) as u64)
+        let tickets_round2: Vec<u64> = (total_slots as u64..(total_slots * 2) as u64)
             .map(|i| queue.submit(|mut out| out[()] = i))
             .collect();
 
         // Read all results from round 2
         for (i, &ticket) in tickets_round2.iter().enumerate() {
-            let expected = (TOTAL_SLOTS + i) as u64;
+            let expected = (total_slots + i) as u64;
             let result = queue.poll(ticket).expect("should be ready");
             assert_eq!(
                 *result, expected,
@@ -345,16 +383,19 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
-        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> =
-            Arc::new(GpuJobQueue::new(Ix0(), |inputs, outputs| {
-                for (i, input) in inputs.iter().enumerate() {
-                    outputs[i] = input * 2;
-                }
-            }));
-
         let batch_count = Arc::new(AtomicUsize::new(0));
         let num_threads = 4;
         let jobs_per_thread = BATCH_SIZE * 2; // Each thread submits 2 batches worth
+
+        let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
+            Ix0(),
+            num_threads * jobs_per_thread,
+            |inputs, outputs| {
+                for (i, input) in inputs.iter().enumerate() {
+                    outputs[i] = input * 2;
+                }
+            },
+        ));
 
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {

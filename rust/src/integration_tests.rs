@@ -30,6 +30,7 @@ mod tests {
         type Output = PolicyValue<9>;
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
+            BATCH_SIZE,
             move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
@@ -76,10 +77,12 @@ mod tests {
     fn test_multiple_batches_simple() {
         let dispatch_count = Arc::new(AtomicUsize::new(0));
         let dispatch_count_clone = dispatch_count.clone();
+        let num_evals = BATCH_SIZE * 3;
 
         type Output = PolicyValue<9>;
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
+            num_evals,
             move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
@@ -93,7 +96,6 @@ mod tests {
         let executor = Executor::new(|| queue.listen());
 
         // Create 3 batches worth of futures
-        let num_evals = BATCH_SIZE * 3;
         let completed = Rc::new(RefCell::new(0usize));
         let futures: Vec<_> = (0..num_evals)
             .map(|_| {
@@ -125,10 +127,12 @@ mod tests {
     fn test_multiple_mcts_searches() {
         let dispatch_count = Arc::new(AtomicUsize::new(0));
         let dispatch_count_clone = dispatch_count.clone();
+        let num_searches = BATCH_SIZE * 2;
 
         type Output = PolicyValue<9>;
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
+            num_searches,
             move |_inputs, outputs: &mut [Output]| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
                 for output in outputs.iter_mut() {
@@ -146,7 +150,6 @@ mod tests {
         let executor = Executor::new(|| queue.listen());
 
         // Run multiple MCTS searches concurrently
-        let num_searches = BATCH_SIZE * 2;
 
         let completed = Rc::new(RefCell::new(0usize));
         let futures: Vec<_> = (0..num_searches)
