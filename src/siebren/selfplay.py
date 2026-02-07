@@ -20,6 +20,7 @@ class SelfPlay:
         game: str,
         num_threads: int = 32,
         workers_per_thread: int = 256,
+        mcts_num_simulations: int = 20,
         seed: int = 42,
     ) -> None:
         self.game = _normalize_game(game)
@@ -28,8 +29,12 @@ class SelfPlay:
             f"num_threads * workers_per_thread must be >= 256 (the batch size), "
             f"got {num_threads} * {workers_per_thread} = {total_workers}"
         )
+        assert mcts_num_simulations > 0, (
+            f"mcts_num_simulations must be >= 1, got {mcts_num_simulations}"
+        )
         self.num_threads = num_threads
         self.workers_per_thread = workers_per_thread
+        self.mcts_num_simulations = mcts_num_simulations
         self.seed = seed
 
     def play_games(
@@ -59,6 +64,7 @@ class SelfPlay:
                 num_samples,
                 self.seed,
                 execute_model,
+                mcts_num_simulations=self.mcts_num_simulations,
                 use_rust_cudagraph=use_rust_cudagraph,
                 model=model,
                 selfplay_precision=selfplay_precision,
@@ -79,4 +85,5 @@ class SelfPlay:
             num_samples,
             self.seed,
             execute_model,
+            mcts_num_simulations=self.mcts_num_simulations,
         )

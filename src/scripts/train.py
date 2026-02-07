@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -27,17 +27,18 @@ from siebren import (
 
 @dataclass
 class TrainConfig:
-    game: str = "tictactoe"
+    game: str = "bytefight"
     epochs: int = 100
-    samples_per_epoch: int = 5_000_000
+    samples_per_epoch: int = 1_000_000
     train_batch_size: int = 2048
-    train_steps_per_epoch: int = 256
-    replay_buffer_capacity: int = 50_000_000
+    train_steps_per_epoch: int = 512
+    replay_buffer_capacity: int = 10_000_000
     lr: float = 1e-3
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 2.0
     l2_weight: float = 1e-4
     num_threads: int = 32
-    workers_per_thread: int = 256
+    workers_per_thread: int = 32
+    mcts_num_simulations: int = 64
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     wandb_project: str = "siebren"
@@ -48,7 +49,7 @@ class TrainConfig:
     compile_mode: str = "reduce-overhead"
     compile_fullgraph: bool = False
     cudagraphs: bool = False
-    selfplay_backend: str = "python"
+    selfplay_backend: str = "rust-cudagraph"
     inference_cuda_graph: bool = True
     selfplay_precision: str = "fp32"
     matmul_precision: str = "high"
@@ -378,16 +379,18 @@ def maybe_compile_model(model: nn.Module, config: TrainConfig) -> nn.Module:
         try:
             import torch._inductor.config as inductor_config
 
-            inductor_config.triton.cudagraphs = bool(config.cudagraphs)
-            if hasattr(inductor_config.triton, "cudagraph_trees"):
-                inductor_config.triton.cudagraph_trees = bool(config.cudagraphs)
+            triton_config = getattr(inductor_config, "triton", None)
+            if triton_config is not None:
+                triton_config.cudagraphs = bool(config.cudagraphs)
+                if hasattr(triton_config, "cudagraph_trees"):
+                    triton_config.cudagraph_trees = bool(config.cudagraphs)
         except Exception as exc:
             print(f"Warning: unable to configure inductor cudagraphs: {exc}")
     try:
         compiled = torch.compile(
             model, mode=config.compile_mode, fullgraph=config.compile_fullgraph
         )
-        return compiled
+        return cast(nn.Module, compiled)
     except Exception as exc:
         print(f"torch.compile failed ({exc}); running eager.")
         return model
@@ -425,6 +428,23 @@ def train_step(
     # Value loss: MSE
     value_loss = F.mse_loss(pred_values, target_values)
 
+    with torch.no_grad():
+        value_pred_mean = pred_values.mean()
+        value_pred_std = pred_values.std(unbiased=False)
+        target_value_mean = target_values.mean()
+        target_value_std = target_values.std(unbiased=False)
+        value_sign_acc = ((pred_values >= 0.0) == (target_values >= 0.0)).float().mean()
+
+        pred_centered = pred_values - value_pred_mean
+        target_centered = target_values - target_value_mean
+        corr_denom = (
+            pred_centered.pow(2).mean().sqrt() * target_centered.pow(2).mean().sqrt()
+        )
+        if corr_denom.item() > 1e-8:
+            value_corr = (pred_centered * target_centered).mean() / corr_denom
+        else:
+            value_corr = torch.zeros((), device=device)
+
     # L2 regularization
     l2_loss = torch.zeros((), device=device)
     if l2_weight > 0.0:
@@ -445,6 +465,12 @@ def train_step(
         "value_loss": value_loss.item(),
         "l2_loss": l2_loss.item(),
         "total_loss": total_loss.item(),
+        "value_pred_mean": value_pred_mean.item(),
+        "value_pred_std": value_pred_std.item(),
+        "target_value_mean": target_value_mean.item(),
+        "target_value_std": target_value_std.item(),
+        "value_sign_acc": value_sign_acc.item(),
+        "value_corr": value_corr.item(),
     }
 
 
@@ -484,6 +510,7 @@ def train(config: TrainConfig):
         game=config.game,
         num_threads=config.num_threads,
         workers_per_thread=config.workers_per_thread,
+        mcts_num_simulations=config.mcts_num_simulations,
         seed=config.seed,
     )
     replay_buffer = EphemeralReplayBuffer(
@@ -603,6 +630,7 @@ def train(config: TrainConfig):
             "epoch": epoch,
             "selfplay/games_completed": games_completed,
             "selfplay/samples_collected": samples_collected,
+            "selfplay/mcts_num_simulations": config.mcts_num_simulations,
             "selfplay/moves_per_game": moves_per_game,
             "selfplay/batches": dispatch_batches,
             "selfplay/time_sec": selfplay_time,
@@ -639,6 +667,12 @@ def train(config: TrainConfig):
             epoch_value_loss = 0.0
             epoch_l2_loss = 0.0
             epoch_total_loss = 0.0
+            epoch_value_pred_mean = 0.0
+            epoch_value_pred_std = 0.0
+            epoch_target_value_mean = 0.0
+            epoch_target_value_std = 0.0
+            epoch_value_sign_acc = 0.0
+            epoch_value_corr = 0.0
 
             for step in range(config.train_steps_per_epoch):
                 losses = train_step(
@@ -655,9 +689,16 @@ def train(config: TrainConfig):
                 epoch_value_loss += losses["value_loss"]
                 epoch_l2_loss += losses["l2_loss"]
                 epoch_total_loss += losses["total_loss"]
+                epoch_value_pred_mean += losses["value_pred_mean"]
+                epoch_value_pred_std += losses["value_pred_std"]
+                epoch_target_value_mean += losses["target_value_mean"]
+                epoch_target_value_std += losses["target_value_std"]
+                epoch_value_sign_acc += losses["value_sign_acc"]
+                epoch_value_corr += losses["value_corr"]
 
             train_time = time.time() - train_start
             num_steps = config.train_steps_per_epoch
+            train_samples_drawn = num_steps * config.train_batch_size
 
             # Log training metrics
             train_metrics = {
@@ -665,8 +706,18 @@ def train(config: TrainConfig):
                 "train/value_loss": epoch_value_loss / num_steps,
                 "train/l2_loss": epoch_l2_loss / num_steps,
                 "train/total_loss": epoch_total_loss / num_steps,
+                "train/value_pred_mean": epoch_value_pred_mean / num_steps,
+                "train/value_pred_std": epoch_value_pred_std / num_steps,
+                "train/target_value_mean": epoch_target_value_mean / num_steps,
+                "train/target_value_std": epoch_target_value_std / num_steps,
+                "train/value_sign_acc": epoch_value_sign_acc / num_steps,
+                "train/value_corr": epoch_value_corr / num_steps,
                 "train/time_sec": train_time,
                 "train/steps_per_sec": num_steps / train_time,
+                "train/samples_drawn": train_samples_drawn,
+                "train/sample_reuse_ratio_vs_selfplay": (
+                    train_samples_drawn / max(samples_collected, 1)
+                ),
             }
             wandb.log(train_metrics, step=global_step)
 
@@ -696,7 +747,7 @@ def main():
     parser.add_argument(
         "--game",
         type=str,
-        default="tictactoe",
+        default="bytefight",
         choices=["tictactoe", "connect4", "bytefight"],
         help="Game to train on",
     )
@@ -704,7 +755,7 @@ def main():
     parser.add_argument(
         "--samples-per-epoch",
         type=int,
-        default=5_000_000,
+        default=1_000_000,
         help="Target samples to collect per epoch",
     )
     parser.add_argument(
@@ -713,20 +764,20 @@ def main():
     parser.add_argument(
         "--train-steps-per-epoch",
         type=int,
-        default=256,
+        default=512,
         help="Training steps per epoch",
     )
     parser.add_argument(
         "--replay-buffer-capacity",
         type=int,
-        default=50_000_000,
+        default=10_000_000,
         help="Replay buffer capacity",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument(
         "--value-loss-weight",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Weight for value loss term",
     )
     parser.add_argument(
@@ -739,7 +790,13 @@ def main():
         "--num-threads", type=int, default=32, help="Number of worker threads"
     )
     parser.add_argument(
-        "--workers-per-thread", type=int, default=256, help="Workers per thread"
+        "--workers-per-thread", type=int, default=32, help="Workers per thread"
+    )
+    parser.add_argument(
+        "--mcts-num-simulations",
+        type=int,
+        default=64,
+        help="MCTS simulations per move during self-play",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -796,7 +853,7 @@ def main():
     parser.add_argument(
         "--selfplay-backend",
         type=str,
-        default="python",
+        default="rust-cudagraph",
         choices=["python", "rust-cudagraph"],
         help="Self-play inference backend",
     )
@@ -835,6 +892,7 @@ def main():
         l2_weight=args.l2_weight,
         num_threads=args.num_threads,
         workers_per_thread=args.workers_per_thread,
+        mcts_num_simulations=args.mcts_num_simulations,
         seed=args.seed,
         device=args.device,
         wandb_project=args.wandb_project,

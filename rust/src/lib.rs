@@ -225,7 +225,15 @@ typed_ephemeral_replay_buffer!(
 /// - policy: (BATCH_SIZE, 9) float32 - action probabilities
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
-#[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
+#[pyo3(signature = (
+    replay_buffer,
+    num_threads,
+    workers_per_thread,
+    target_samples,
+    seed,
+    execute_model,
+    mcts_num_simulations = 20
+))]
 fn selfplay_tictactoe_ephemeral(
     py: Python<'_>,
     replay_buffer: &TicTacToeEphemeralReplayBuffer,
@@ -234,17 +242,31 @@ fn selfplay_tictactoe_ephemeral(
     target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
+    mcts_num_simulations: usize,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
+    use mcts::MCTSConfig;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
+
+    if mcts_num_simulations == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_num_simulations must be >= 1",
+        ));
+    }
 
     let config = TrainingConfig {
         num_threads,
         workers_per_thread,
         seed,
         target_samples,
-        worker: WorkerConfig::default(),
+        worker: WorkerConfig {
+            mcts: MCTSConfig {
+                num_simulations: mcts_num_simulations,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     };
 
     let dispatch = move |_batch_idx: usize,
@@ -307,7 +329,15 @@ fn selfplay_tictactoe_ephemeral(
 /// - policy: (BATCH_SIZE, 7) float32 - action probabilities for each column
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
-#[pyo3(signature = (replay_buffer, num_threads, workers_per_thread, target_samples, seed, execute_model))]
+#[pyo3(signature = (
+    replay_buffer,
+    num_threads,
+    workers_per_thread,
+    target_samples,
+    seed,
+    execute_model,
+    mcts_num_simulations = 20
+))]
 fn selfplay_connect4_ephemeral(
     py: Python<'_>,
     replay_buffer: &Connect4EphemeralReplayBuffer,
@@ -316,17 +346,31 @@ fn selfplay_connect4_ephemeral(
     target_samples: usize,
     seed: u64,
     execute_model: Py<PyAny>,
+    mcts_num_simulations: usize,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
+    use mcts::MCTSConfig;
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
+
+    if mcts_num_simulations == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_num_simulations must be >= 1",
+        ));
+    }
 
     let config = TrainingConfig {
         num_threads,
         workers_per_thread,
         seed,
         target_samples,
-        worker: WorkerConfig::default(),
+        worker: WorkerConfig {
+            mcts: MCTSConfig {
+                num_simulations: mcts_num_simulations,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     };
 
     let dispatch = move |_batch_idx: usize,
@@ -397,6 +441,7 @@ fn selfplay_connect4_ephemeral(
     seed,
     execute_model = None,
     *,
+    mcts_num_simulations = 20,
     use_rust_cudagraph = false,
     model = None,
     selfplay_precision = "fp32"
@@ -409,22 +454,36 @@ fn selfplay_bytefight_ephemeral(
     target_samples: usize,
     seed: u64,
     execute_model: Option<Py<PyAny>>,
+    mcts_num_simulations: usize,
     use_rust_cudagraph: bool,
     model: Option<Py<PyAny>>,
     selfplay_precision: &str,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
     use cudagraph::ByteFightCudaGraphRunner;
     use eval::PolicyValue;
+    use mcts::MCTSConfig;
     use queue::{queue_shape_for_workers, BATCH_SIZE};
     use training::{run_training, TrainingConfig};
     use worker::WorkerConfig;
+
+    if mcts_num_simulations == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_num_simulations must be >= 1",
+        ));
+    }
 
     let config = TrainingConfig {
         num_threads,
         workers_per_thread,
         seed,
         target_samples,
-        worker: WorkerConfig::default(),
+        worker: WorkerConfig {
+            mcts: MCTSConfig {
+                num_simulations: mcts_num_simulations,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     };
 
     let batches_dispatched = Arc::new(AtomicUsize::new(0));
