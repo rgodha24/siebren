@@ -3,8 +3,6 @@ from typing import Optional
 import torch
 import torch.utils.dlpack as dlpack
 
-_GRAPH_HOLD = []
-
 
 def _validate_bytefight_tensors(
     obs_host: torch.Tensor,
@@ -74,7 +72,7 @@ def capture_bytefight_lane_graph(
     value_device_dlpack,
     stream_handle: int,
     precision: str = "fp32",
-) -> int:
+) -> tuple[int, object]:
     obs_host = dlpack.from_dlpack(obs_host_dlpack)
     obs_device = dlpack.from_dlpack(obs_device_dlpack)
     policy_host = dlpack.from_dlpack(policy_host_dlpack)
@@ -119,17 +117,15 @@ def capture_bytefight_lane_graph(
             run_step()
 
     graph.instantiate()
-    _GRAPH_HOLD.append(
-        (
-            graph,
-            model,
-            obs_host,
-            obs_device,
-            policy_host,
-            policy_device,
-            value_host,
-            value_device,
-            stream,
-        )
+    owner = (
+        graph,
+        model,
+        obs_host,
+        obs_device,
+        policy_host,
+        policy_device,
+        value_host,
+        value_device,
+        stream,
     )
-    return int(graph.raw_cuda_graph_exec())
+    return int(graph.raw_cuda_graph_exec()), owner

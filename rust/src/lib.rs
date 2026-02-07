@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::{fmt::Debug, hash::Hash};
 
 use ndarray::{ArrayView, ArrayViewMut, Dimension, Ix0, Ix1, Ix2, Ix3, Ix4, Ix5, Ix6, RemoveAxis};
@@ -83,6 +84,19 @@ pub mod worker;
 
 use environments::{ByteFight, Connect4, TicTacToe};
 use observation_replay_buffer::ObservationReplayBuffer;
+
+struct ByteFightGraphCacheEntry {
+    model_ptr: usize,
+    num_batches: usize,
+    precision: String,
+    runner: Arc<cudagraph::ByteFightCudaGraphRunner>,
+}
+
+static BYTEFIGHT_GRAPH_CACHE: OnceLock<Mutex<Option<ByteFightGraphCacheEntry>>> = OnceLock::new();
+
+fn bytefight_graph_cache() -> &'static Mutex<Option<ByteFightGraphCacheEntry>> {
+    BYTEFIGHT_GRAPH_CACHE.get_or_init(|| Mutex::new(None))
+}
 
 /// Macro to generate typed ephemeral replay buffer classes for each environment.
 ///
@@ -427,13 +441,43 @@ fn selfplay_bytefight_ephemeral(
             )
         })?;
         let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
-        let runner = Arc::new(ByteFightCudaGraphRunner::new(
-            py,
-            model,
-            num_batches,
-            BATCH_SIZE,
-            selfplay_precision,
-        )?);
+        let model_ptr = model.bind(py).as_ptr() as usize;
+        let runner = {
+            let cache = bytefight_graph_cache();
+            let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
+
+            let needs_rebuild = match guard.as_ref() {
+                Some(entry) => {
+                    entry.model_ptr != model_ptr
+                        || entry.num_batches != num_batches
+                        || entry.precision != selfplay_precision
+                }
+                None => true,
+            };
+
+            if needs_rebuild {
+                let runner = Arc::new(ByteFightCudaGraphRunner::new(
+                    py,
+                    model.clone_ref(py),
+                    num_batches,
+                    BATCH_SIZE,
+                    selfplay_precision,
+                )?);
+                *guard = Some(ByteFightGraphCacheEntry {
+                    model_ptr,
+                    num_batches,
+                    precision: selfplay_precision.to_string(),
+                    runner: runner.clone(),
+                });
+                runner
+            } else {
+                guard
+                    .as_ref()
+                    .expect("cached runner should exist")
+                    .runner
+                    .clone()
+            }
+        };
 
         let batches_dispatched_ref = batches_dispatched.clone();
         let dispatch = move |batch_idx: usize,

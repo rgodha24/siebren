@@ -204,6 +204,8 @@ fn cuda_malloc_device_f32(count: usize, context: &str) -> PyResult<*mut c_void> 
 struct ByteFightCudaGraphLane {
     stream: cudaStream_t,
     graph_exec: cudaGraphExec_t,
+    /// Owns Python-side graph/tensor objects for this lane.
+    _py_owner: Py<PyAny>,
     obs_host: *mut f32,
     obs_dev: *mut c_void,
     policy_host: *mut f32,
@@ -317,7 +319,7 @@ impl ByteFightCudaGraphRunner {
             )?;
             let value_dev_capsule = dlpack_capsule(py, value_dev, &value_shape, DL_DEVICE_CUDA, 0)?;
 
-            let exec_handle: u64 = capture_fn
+            let (exec_handle, py_owner): (u64, Py<PyAny>) = capture_fn
                 .call1((
                     model.clone_ref(py),
                     obs_host_capsule,
@@ -334,6 +336,7 @@ impl ByteFightCudaGraphRunner {
             let lane = ByteFightCudaGraphLane {
                 stream,
                 graph_exec: exec_handle as cudaGraphExec_t,
+                _py_owner: py_owner,
                 obs_host,
                 obs_dev,
                 policy_host,
