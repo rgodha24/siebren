@@ -21,15 +21,15 @@ def _validate_bytefight_tensors(
     if policy_device.device.type != "cuda" or value_device.device.type != "cuda":
         raise ValueError("policy_device/value_device must be CUDA tensors")
 
-    if obs_host.dtype != torch.float32 or obs_device.dtype != torch.float32:
-        raise ValueError("obs_host/obs_device must be float32")
+    if obs_host.dtype != torch.uint8 or obs_device.dtype != torch.uint8:
+        raise ValueError("obs_host/obs_device must be uint8")
     if policy_host.dtype != torch.float32 or policy_device.dtype != torch.float32:
         raise ValueError("policy_host/policy_device must be float32")
     if value_host.dtype != torch.float32 or value_device.dtype != torch.float32:
         raise ValueError("value_host/value_device must be float32")
 
-    if obs_host.ndim != 2 or obs_device.ndim != 2:
-        raise ValueError("obs tensors must be rank-2")
+    if obs_host.ndim != 3 or obs_device.ndim != 3:
+        raise ValueError("obs tensors must be rank-3")
     if policy_host.ndim != 2 or policy_device.ndim != 2:
         raise ValueError("policy tensors must be rank-2")
     if value_host.ndim != 1 or value_device.ndim != 1:
@@ -38,8 +38,8 @@ def _validate_bytefight_tensors(
     batch = obs_host.shape[0]
     if obs_host.shape != obs_device.shape:
         raise ValueError("obs_host/obs_device shape mismatch")
-    if obs_host.shape[1] != 18:
-        raise ValueError("ByteFight obs must be shape (B, 18)")
+    if obs_host.shape[1] != 16 or obs_host.shape[2] != 16:
+        raise ValueError("ByteFight obs must be shape (B, 16, 16)")
     if policy_host.shape != policy_device.shape:
         raise ValueError("policy_host/policy_device shape mismatch")
     if policy_host.shape[0] != batch or policy_host.shape[1] != 11:

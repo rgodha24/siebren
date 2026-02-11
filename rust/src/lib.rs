@@ -205,14 +205,14 @@ typed_ephemeral_replay_buffer!(
     7
 );
 
-// ByteFight: observations (18,) f32, sampled as (n, 18)
+// ByteFight: observations (16, 16) u8 bit-packed planes, sampled as (n, 16, 16)
 typed_ephemeral_replay_buffer!(
     ByteFightEphemeralReplayBuffer,
-    f32,
-    Ix1,
+    u8,
     Ix2,
+    Ix3,
     ByteFight::OBS_SHAPE,
-    |n| Ix2(n, 18),
+    |n| Ix3(n, 16, 16),
     11
 );
 
@@ -425,8 +425,8 @@ fn selfplay_connect4_ephemeral(
 
 /// Run ByteFight self-play with Python model callback.
 ///
-/// The callback receives observations as a (BATCH_SIZE, 18) float32 numpy array.
-/// Observations are 18 heuristic features computed from the game state.
+/// The callback receives observations as a (BATCH_SIZE, 16, 16) uint8 numpy array.
+/// Each cell stores 8 one-hot planes packed into bits 0..7.
 ///
 /// Returns (policy, value) tuple where:
 /// - policy: (BATCH_SIZE, 11) float32 - action probabilities
@@ -540,7 +540,7 @@ fn selfplay_bytefight_ephemeral(
 
         let batches_dispatched_ref = batches_dispatched.clone();
         let dispatch = move |batch_idx: usize,
-                             obs_view: ArrayView<f32, Ix2>,
+                             obs_view: ArrayView<u8, Ix3>,
                              outputs: &mut [PolicyValue<11>]| {
             batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
             runner.dispatch(batch_idx, obs_view, outputs);
@@ -555,7 +555,7 @@ fn selfplay_bytefight_ephemeral(
         })?;
         let batches_dispatched_ref = batches_dispatched.clone();
         let dispatch = move |_batch_idx: usize,
-                             obs_view: ArrayView<f32, Ix2>,
+                             obs_view: ArrayView<u8, Ix3>,
                              outputs: &mut [PolicyValue<11>]| {
             batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
             Python::attach(|py| {
@@ -565,7 +565,7 @@ fn selfplay_bytefight_ephemeral(
                 let np_obs =
                     unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
 
-                // Call Python: (BATCH_SIZE, 18) -> ((BATCH_SIZE, 11), (BATCH_SIZE,))
+                // Call Python: (BATCH_SIZE, 16, 16) -> ((BATCH_SIZE, 11), (BATCH_SIZE,))
                 let result = execute_model
                     .call1(py, (np_obs,))
                     .expect("execute_model call failed");

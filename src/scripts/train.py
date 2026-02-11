@@ -121,17 +121,20 @@ class Connect4Net(nn.Module):
 
 
 class ByteFightNet(nn.Module):
-    """MLP for ByteFight (18 heuristic inputs -> 11 policy logits + 1 value)."""
+    """MLP for ByteFight bitpacked 16x16 observations (~100k params)."""
 
-    def __init__(self, hidden_dim: int = 256):
+    def __init__(self, hidden_dim: int = 48):
         super().__init__()
+        self.register_buffer(
+            "_bit_shifts",
+            torch.arange(8, dtype=torch.uint8).view(1, 8, 1, 1),
+            persistent=False,
+        )
         self.trunk = nn.Sequential(
-            nn.Linear(18, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(8 * 16 * 16, hidden_dim),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
         )
         self.policy_head = nn.Linear(hidden_dim, 11)
         self.value_head = nn.Linear(hidden_dim, 1)
@@ -139,12 +142,25 @@ class ByteFightNet(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: (B, 18) float32 heuristic features
+            x: (B, 16, 16) uint8 bitpacked board features
 
         Returns:
             policy: (B, 11) action logits (not softmaxed)
             value: (B,) position evaluation in [-1, 1]
         """
+        if x.ndim != 3:
+            raise ValueError(
+                f"Expected ByteFight obs shape (B, 16, 16), got {tuple(x.shape)}"
+            )
+        if x.dtype != torch.uint8:
+            x = x.to(torch.uint8)
+
+        shifts = cast(torch.Tensor, self._bit_shifts)
+        bitplanes = torch.bitwise_and(
+            torch.bitwise_right_shift(x.unsqueeze(1), shifts),
+            1,
+        ).to(torch.float32)
+        x = bitplanes.flatten(1)
         h = self.trunk(x)
         policy = self.policy_head(h)
         value = self.value_head(h).squeeze(-1).tanh()
@@ -235,7 +251,7 @@ def make_execute_model(
     def execute_model(
         obs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4, (256, 18) for ByteFight
+        # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4, (256, 16, 16) for ByteFight
         x = torch.from_numpy(obs).to(device)
         policy_logits, value = model_forward(x)
 

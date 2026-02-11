@@ -1,4 +1,4 @@
-use ndarray::{ArrayView1, ArrayViewMut, Ix1};
+use ndarray::{ArrayView2, ArrayViewMut, Ix2};
 use serde::{Deserialize, Serialize};
 
 use crate::{Environment, GameNotation, Player, TerminalState};
@@ -49,12 +49,12 @@ impl crate::Action for ByteFightAction {
 }
 
 impl Environment for ByteFight {
-    type ObsElem = f32;
-    type ObsDim = Ix1;
+    type ObsElem = u8;
+    type ObsDim = Ix2;
     type Action = ByteFightAction;
     type RollbackState = game::RollbackState;
     const NUM_ACTIONS: usize = 11;
-    const OBS_SHAPE: Ix1 = Ix1(types::HEURISTICS_SIZE);
+    const OBS_SHAPE: Ix2 = Ix2(types::OBS_SIDE, types::OBS_SIDE);
 
     fn new() -> Self {
         let mut rng = rand::rng();
@@ -82,9 +82,11 @@ impl Environment for ByteFight {
         }
     }
 
-    fn observation(&self, mut out: ArrayViewMut<f32, Ix1>) {
-        let heuristics = self.board.heuristics();
-        out.assign(&ArrayView1::from(&heuristics));
+    fn observation(&self, mut out: ArrayViewMut<u8, Ix2>) {
+        let obs = self.board.bitpacked_observation_16x16();
+        let obs_view = ArrayView2::from_shape((types::OBS_SIDE, types::OBS_SIDE), &obs)
+            .expect("bitpacked observation shape");
+        out.assign(&obs_view);
     }
 
     fn apply_action(&mut self, action: Self::Action) -> Self::RollbackState {

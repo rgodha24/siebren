@@ -170,9 +170,11 @@ impl ValidMoves {
     }
 }
 
-pub const HEURISTICS_SIZE: usize = 18;
+pub const OBS_SIDE: usize = 16;
+pub const OBS_PLANES: usize = 8;
+pub const OBS_CELLS: usize = OBS_SIDE * OBS_SIDE;
 
-pub type BoardHeuristics = [f32; HEURISTICS_SIZE];
+pub type BitpackedObservation = [u8; OBS_CELLS];
 
 #[cfg(test)]
 mod tests {

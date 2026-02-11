@@ -5,7 +5,7 @@ use std::mem::size_of;
 use std::slice;
 
 use cudarc::runtime::sys as cuda;
-use ndarray::{ArrayView, Ix2};
+use ndarray::{ArrayView, Ix3};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -24,8 +24,10 @@ const DL_TENSOR_NAME: &[u8] = b"dltensor\0";
 const DL_DEVICE_CPU: i32 = 1;
 const DL_DEVICE_CUDA: i32 = 2;
 const DL_DTYPE_FLOAT: u8 = 2;
+const DL_DTYPE_UINT: u8 = 1;
 
-const BYTEFIGHT_OBS_DIM: usize = 18;
+const BYTEFIGHT_OBS_SIDE: usize = 16;
+const BYTEFIGHT_OBS_CELLS: usize = BYTEFIGHT_OBS_SIDE * BYTEFIGHT_OBS_SIDE;
 const BYTEFIGHT_ACTIONS: usize = 11;
 
 #[repr(C)]
@@ -109,6 +111,8 @@ fn dlpack_capsule(
     shape: &[i64],
     device_type: i32,
     device_id: i32,
+    dtype_code: u8,
+    dtype_bits: u8,
 ) -> PyResult<Py<PyAny>> {
     let ctx = Box::new(DLPackContext {
         shape: shape.to_vec().into_boxed_slice(),
@@ -125,8 +129,8 @@ fn dlpack_capsule(
             },
             ndim: shape.len() as i32,
             dtype: DLDataType {
-                code: DL_DTYPE_FLOAT,
-                bits: 32,
+                code: dtype_code,
+                bits: dtype_bits,
                 lanes: 1,
             },
             shape: shape_ptr,
@@ -187,6 +191,18 @@ fn cuda_malloc_host_f32(count: usize, context: &str) -> PyResult<*mut f32> {
     Ok(ptr.cast::<f32>())
 }
 
+fn cuda_malloc_host_u8(count: usize, context: &str) -> PyResult<*mut u8> {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let bytes = count;
+    unsafe {
+        check_cuda(
+            cuda::cudaMallocHost(&mut ptr as *mut *mut c_void, bytes),
+            context,
+        )?;
+    }
+    Ok(ptr.cast::<u8>())
+}
+
 fn cuda_malloc_device_f32(count: usize, context: &str) -> PyResult<*mut c_void> {
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let bytes = count
@@ -201,12 +217,24 @@ fn cuda_malloc_device_f32(count: usize, context: &str) -> PyResult<*mut c_void> 
     Ok(ptr)
 }
 
+fn cuda_malloc_device_u8(count: usize, context: &str) -> PyResult<*mut c_void> {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let bytes = count;
+    unsafe {
+        check_cuda(
+            cuda::cudaMalloc(&mut ptr as *mut *mut c_void, bytes),
+            context,
+        )?;
+    }
+    Ok(ptr)
+}
+
 struct ByteFightCudaGraphLane {
     stream: cudaStream_t,
     graph_exec: cudaGraphExec_t,
     /// Owns Python-side graph/tensor objects for this lane.
     _py_owner: Py<PyAny>,
-    obs_host: *mut f32,
+    obs_host: *mut u8,
     obs_dev: *mut c_void,
     policy_host: *mut f32,
     policy_dev: *mut c_void,
@@ -257,11 +285,15 @@ impl ByteFightCudaGraphRunner {
         let module = PyModule::import(py, "siebren.cudagraph_backend")?;
         let capture_fn = module.getattr("capture_bytefight_lane_graph")?;
 
-        let obs_count = batch_size * BYTEFIGHT_OBS_DIM;
+        let obs_count = batch_size * BYTEFIGHT_OBS_CELLS;
         let policy_count = batch_size * BYTEFIGHT_ACTIONS;
         let value_count = batch_size;
 
-        let obs_shape = [batch_size as i64, BYTEFIGHT_OBS_DIM as i64];
+        let obs_shape = [
+            batch_size as i64,
+            BYTEFIGHT_OBS_SIDE as i64,
+            BYTEFIGHT_OBS_SIDE as i64,
+        ];
         let policy_shape = [batch_size as i64, BYTEFIGHT_ACTIONS as i64];
         let value_shape = [batch_size as i64];
 
@@ -277,7 +309,7 @@ impl ByteFightCudaGraphRunner {
             }
 
             let obs_host =
-                cuda_malloc_host_f32(obs_count, &format!("cudaMallocHost obs lane {}", lane_idx))?;
+                cuda_malloc_host_u8(obs_count, &format!("cudaMallocHost obs lane {}", lane_idx))?;
             let policy_host = cuda_malloc_host_f32(
                 policy_count,
                 &format!("cudaMallocHost policy lane {}", lane_idx),
@@ -288,7 +320,7 @@ impl ByteFightCudaGraphRunner {
             )?;
 
             let obs_dev =
-                cuda_malloc_device_f32(obs_count, &format!("cudaMalloc obs lane {}", lane_idx))?;
+                cuda_malloc_device_u8(obs_count, &format!("cudaMalloc obs lane {}", lane_idx))?;
             let policy_dev = cuda_malloc_device_f32(
                 policy_count,
                 &format!("cudaMalloc policy lane {}", lane_idx),
@@ -298,26 +330,53 @@ impl ByteFightCudaGraphRunner {
                 &format!("cudaMalloc value lane {}", lane_idx),
             )?;
 
-            let obs_host_capsule =
-                dlpack_capsule(py, obs_host.cast::<c_void>(), &obs_shape, DL_DEVICE_CPU, 0)?;
-            let obs_dev_capsule = dlpack_capsule(py, obs_dev, &obs_shape, DL_DEVICE_CUDA, 0)?;
+            let obs_host_capsule = dlpack_capsule(
+                py,
+                obs_host.cast::<c_void>(),
+                &obs_shape,
+                DL_DEVICE_CPU,
+                0,
+                DL_DTYPE_UINT,
+                8,
+            )?;
+            let obs_dev_capsule =
+                dlpack_capsule(py, obs_dev, &obs_shape, DL_DEVICE_CUDA, 0, DL_DTYPE_UINT, 8)?;
             let policy_host_capsule = dlpack_capsule(
                 py,
                 policy_host.cast::<c_void>(),
                 &policy_shape,
                 DL_DEVICE_CPU,
                 0,
+                DL_DTYPE_FLOAT,
+                32,
             )?;
-            let policy_dev_capsule =
-                dlpack_capsule(py, policy_dev, &policy_shape, DL_DEVICE_CUDA, 0)?;
+            let policy_dev_capsule = dlpack_capsule(
+                py,
+                policy_dev,
+                &policy_shape,
+                DL_DEVICE_CUDA,
+                0,
+                DL_DTYPE_FLOAT,
+                32,
+            )?;
             let value_host_capsule = dlpack_capsule(
                 py,
                 value_host.cast::<c_void>(),
                 &value_shape,
                 DL_DEVICE_CPU,
                 0,
+                DL_DTYPE_FLOAT,
+                32,
             )?;
-            let value_dev_capsule = dlpack_capsule(py, value_dev, &value_shape, DL_DEVICE_CUDA, 0)?;
+            let value_dev_capsule = dlpack_capsule(
+                py,
+                value_dev,
+                &value_shape,
+                DL_DEVICE_CUDA,
+                0,
+                DL_DTYPE_FLOAT,
+                32,
+            )?;
 
             let (exec_handle, py_owner): (u64, Py<PyAny>) = capture_fn
                 .call1((
@@ -353,10 +412,13 @@ impl ByteFightCudaGraphRunner {
     pub fn dispatch(
         &self,
         batch_idx: usize,
-        obs_view: ArrayView<f32, Ix2>,
+        obs_view: ArrayView<u8, Ix3>,
         outputs: &mut [PolicyValue<11>],
     ) {
-        debug_assert_eq!(obs_view.shape(), &[self.batch_size, BYTEFIGHT_OBS_DIM]);
+        debug_assert_eq!(
+            obs_view.shape(),
+            &[self.batch_size, BYTEFIGHT_OBS_SIDE, BYTEFIGHT_OBS_SIDE]
+        );
         debug_assert_eq!(outputs.len(), self.batch_size);
 
         let lane = &self.lanes[batch_idx % self.lanes.len()];
@@ -365,7 +427,7 @@ impl ByteFightCudaGraphRunner {
             .as_slice()
             .expect("bytefight queue observation batch must be contiguous");
         let obs_dst = unsafe {
-            slice::from_raw_parts_mut(lane.obs_host, self.batch_size * BYTEFIGHT_OBS_DIM)
+            slice::from_raw_parts_mut(lane.obs_host, self.batch_size * BYTEFIGHT_OBS_CELLS)
         };
         obs_dst.copy_from_slice(obs_src);
 
