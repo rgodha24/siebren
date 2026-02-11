@@ -57,15 +57,17 @@ class SelfPlay:
         assert isinstance(replay_buffer, EphemeralReplayBuffer)
 
         if self.game == "bytefight":
+            if model is None:
+                raise ValueError(
+                    "bytefight self-play requires a CUDA model for rust-cudagraph backend"
+                )
             return _native.selfplay_bytefight_ephemeral(
                 replay_buffer._inner,
                 self.num_threads,
                 self.workers_per_thread,
                 num_samples,
                 self.seed,
-                execute_model,
                 mcts_num_simulations=self.mcts_num_simulations,
-                use_rust_cudagraph=use_rust_cudagraph,
                 model=model,
                 selfplay_precision=selfplay_precision,
             )

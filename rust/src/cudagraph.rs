@@ -11,6 +11,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use crate::eval::PolicyValue;
+use crate::queue::BatchCompletion;
 
 #[allow(non_camel_case_types)]
 type cudaStream_t = cuda::cudaStream_t;
@@ -242,6 +243,38 @@ struct ByteFightCudaGraphLane {
     value_dev: *mut c_void,
 }
 
+struct LaneCompletionContext {
+    policy_host: *const f32,
+    value_host: *const f32,
+    batch_size: usize,
+    completion: Option<BatchCompletion<PolicyValue<11>>>,
+}
+
+unsafe impl Send for LaneCompletionContext {}
+
+unsafe extern "C" fn lane_completion_callback(user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+
+    let mut ctx = unsafe { Box::from_raw(user_data.cast::<LaneCompletionContext>()) };
+    let policy_src =
+        unsafe { slice::from_raw_parts(ctx.policy_host, ctx.batch_size * BYTEFIGHT_ACTIONS) };
+    let value_src = unsafe { slice::from_raw_parts(ctx.value_host, ctx.batch_size) };
+
+    let mut outputs = vec![PolicyValue::<11>::default(); ctx.batch_size];
+    for (i, out) in outputs.iter_mut().enumerate() {
+        let start = i * BYTEFIGHT_ACTIONS;
+        out.policy
+            .copy_from_slice(&policy_src[start..start + BYTEFIGHT_ACTIONS]);
+        out.value = value_src[i];
+    }
+
+    if let Some(completion) = ctx.completion.take() {
+        completion.complete(&outputs);
+    }
+}
+
 impl Drop for ByteFightCudaGraphLane {
     fn drop(&mut self) {
         unsafe {
@@ -409,17 +442,16 @@ impl ByteFightCudaGraphRunner {
         Ok(Self { batch_size, lanes })
     }
 
-    pub fn dispatch(
+    pub fn dispatch_async(
         &self,
         batch_idx: usize,
         obs_view: ArrayView<u8, Ix3>,
-        outputs: &mut [PolicyValue<11>],
+        completion: BatchCompletion<PolicyValue<11>>,
     ) {
         debug_assert_eq!(
             obs_view.shape(),
             &[self.batch_size, BYTEFIGHT_OBS_SIDE, BYTEFIGHT_OBS_SIDE]
         );
-        debug_assert_eq!(outputs.len(), self.batch_size);
 
         let lane = &self.lanes[batch_idx % self.lanes.len()];
 
@@ -436,21 +468,21 @@ impl ByteFightCudaGraphRunner {
                 cuda::cudaGraphLaunch(lane.graph_exec, lane.stream),
                 "cudaGraphLaunch",
             );
+
+            let ctx = Box::new(LaneCompletionContext {
+                policy_host: lane.policy_host,
+                value_host: lane.value_host,
+                batch_size: self.batch_size,
+                completion: Some(completion),
+            });
             check_cuda_or_panic(
-                cuda::cudaStreamSynchronize(lane.stream),
-                "cudaStreamSynchronize",
+                cuda::cudaLaunchHostFunc(
+                    lane.stream,
+                    Some(lane_completion_callback),
+                    Box::into_raw(ctx).cast::<c_void>(),
+                ),
+                "cudaLaunchHostFunc",
             );
-        }
-
-        let policy_src =
-            unsafe { slice::from_raw_parts(lane.policy_host, self.batch_size * BYTEFIGHT_ACTIONS) };
-        let value_src = unsafe { slice::from_raw_parts(lane.value_host, self.batch_size) };
-
-        for (i, out) in outputs.iter_mut().enumerate() {
-            let start = i * BYTEFIGHT_ACTIONS;
-            out.policy
-                .copy_from_slice(&policy_src[start..start + BYTEFIGHT_ACTIONS]);
-            out.value = value_src[i];
         }
     }
 }

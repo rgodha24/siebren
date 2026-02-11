@@ -143,11 +143,13 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            move |_batch_idx, inputs, outputs| {
+            move |_batch_idx, inputs, completion| {
                 submit_count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -178,10 +180,12 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input + 100;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -208,10 +212,12 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = *input;
                 }
+                completion.complete(&outputs);
             },
         ));
 

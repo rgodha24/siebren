@@ -566,13 +566,16 @@ def train(config: TrainConfig):
         )
         config.cudagraphs = False
 
-    use_rust_cudagraph = (
-        config.selfplay_backend == "rust-cudagraph" and config.game == "bytefight"
-    )
+    use_rust_cudagraph = config.game == "bytefight"
     if config.selfplay_backend == "rust-cudagraph" and config.game != "bytefight":
         print(
             "Warning: rust-cudagraph backend currently supports only bytefight; "
             "falling back to python callback backend."
+        )
+    if config.game == "bytefight" and config.selfplay_backend != "rust-cudagraph":
+        print(
+            "Warning: bytefight now requires rust-cudagraph backend; "
+            "overriding --selfplay-backend to rust-cudagraph."
         )
 
     model = maybe_compile_model(model, config)
@@ -619,8 +622,6 @@ def train(config: TrainConfig):
             selfplay_result = selfplay.play_games(
                 replay_buffer=replay_buffer,
                 num_samples=config.samples_per_epoch,
-                execute_model=None,
-                use_rust_cudagraph=True,
                 model=model,
                 selfplay_precision=config.selfplay_precision,
             )

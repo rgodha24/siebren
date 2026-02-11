@@ -271,7 +271,8 @@ fn selfplay_tictactoe_ephemeral(
 
     let dispatch = move |_batch_idx: usize,
                          obs_view: ArrayView<i8, Ix2>,
-                         outputs: &mut [PolicyValue<9>]| {
+                         completion: queue::BatchCompletion<PolicyValue<9>>| {
+        let mut outputs = vec![PolicyValue::<9>::default(); queue::BATCH_SIZE];
         Python::attach(|py| {
             // Zero-copy numpy array from obs_view
             // SAFETY: obs_view is valid for the duration of this callback,
@@ -299,6 +300,7 @@ fn selfplay_tictactoe_ephemeral(
                 out.value = value[i];
             }
         });
+        completion.complete(&outputs);
     };
 
     // Release GIL while running training, reacquire in dispatch callback
@@ -375,7 +377,8 @@ fn selfplay_connect4_ephemeral(
 
     let dispatch = move |_batch_idx: usize,
                          obs_view: ArrayView<i8, Ix3>,
-                         outputs: &mut [PolicyValue<7>]| {
+                         completion: queue::BatchCompletion<PolicyValue<7>>| {
+        let mut outputs = vec![PolicyValue::<7>::default(); queue::BATCH_SIZE];
         Python::attach(|py| {
             // Zero-copy numpy array from obs_view
             // SAFETY: obs_view is valid for the duration of this callback,
@@ -403,6 +406,7 @@ fn selfplay_connect4_ephemeral(
                 out.value = value[i];
             }
         });
+        completion.complete(&outputs);
     };
 
     // Release GIL while running training, reacquire in dispatch callback
@@ -439,11 +443,9 @@ fn selfplay_connect4_ephemeral(
     workers_per_thread,
     target_samples,
     seed,
-    execute_model = None,
     *,
     mcts_num_simulations = 20,
-    use_rust_cudagraph = false,
-    model = None,
+    model,
     selfplay_precision = "fp32"
 ))]
 fn selfplay_bytefight_ephemeral(
@@ -453,10 +455,8 @@ fn selfplay_bytefight_ephemeral(
     workers_per_thread: usize,
     target_samples: usize,
     seed: u64,
-    execute_model: Option<Py<PyAny>>,
     mcts_num_simulations: usize,
-    use_rust_cudagraph: bool,
-    model: Option<Py<PyAny>>,
+    model: Py<PyAny>,
     selfplay_precision: &str,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
     use cudagraph::ByteFightCudaGraphRunner;
@@ -488,109 +488,58 @@ fn selfplay_bytefight_ephemeral(
 
     let batches_dispatched = Arc::new(AtomicUsize::new(0));
 
-    let result = if use_rust_cudagraph {
-        let model = model.ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "model is required when use_rust_cudagraph=True",
-            )
-        })?;
-        let total_workers = num_threads.checked_mul(workers_per_thread).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "num_threads * workers_per_thread overflow",
-            )
-        })?;
-        let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
-        let model_ptr = model.bind(py).as_ptr() as usize;
-        let runner = {
-            let cache = bytefight_graph_cache();
-            let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
+    let total_workers = num_threads.checked_mul(workers_per_thread).ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("num_threads * workers_per_thread overflow")
+    })?;
+    let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
+    let model_ptr = model.bind(py).as_ptr() as usize;
+    let runner = {
+        let cache = bytefight_graph_cache();
+        let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
 
-            let needs_rebuild = match guard.as_ref() {
-                Some(entry) => {
-                    entry.model_ptr != model_ptr
-                        || entry.num_batches != num_batches
-                        || entry.precision != selfplay_precision
-                }
-                None => true,
-            };
-
-            if needs_rebuild {
-                let runner = Arc::new(ByteFightCudaGraphRunner::new(
-                    py,
-                    model.clone_ref(py),
-                    num_batches,
-                    BATCH_SIZE,
-                    selfplay_precision,
-                )?);
-                *guard = Some(ByteFightGraphCacheEntry {
-                    model_ptr,
-                    num_batches,
-                    precision: selfplay_precision.to_string(),
-                    runner: runner.clone(),
-                });
-                runner
-            } else {
-                guard
-                    .as_ref()
-                    .expect("cached runner should exist")
-                    .runner
-                    .clone()
+        let needs_rebuild = match guard.as_ref() {
+            Some(entry) => {
+                entry.model_ptr != model_ptr
+                    || entry.num_batches != num_batches
+                    || entry.precision != selfplay_precision
             }
+            None => true,
         };
 
-        let batches_dispatched_ref = batches_dispatched.clone();
-        let dispatch = move |batch_idx: usize,
-                             obs_view: ArrayView<u8, Ix3>,
-                             outputs: &mut [PolicyValue<11>]| {
-            batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
-            runner.dispatch(batch_idx, obs_view, outputs);
-        };
-
-        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch))
-    } else {
-        let execute_model = execute_model.ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "execute_model is required when use_rust_cudagraph=False",
-            )
-        })?;
-        let batches_dispatched_ref = batches_dispatched.clone();
-        let dispatch = move |_batch_idx: usize,
-                             obs_view: ArrayView<u8, Ix3>,
-                             outputs: &mut [PolicyValue<11>]| {
-            batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
-            Python::attach(|py| {
-                // Zero-copy numpy array from obs_view
-                // SAFETY: obs_view is valid for the duration of this callback,
-                // and the numpy array doesn't escape the callback scope.
-                let np_obs =
-                    unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
-
-                // Call Python: (BATCH_SIZE, 16, 16) -> ((BATCH_SIZE, 11), (BATCH_SIZE,))
-                let result = execute_model
-                    .call1(py, (np_obs,))
-                    .expect("execute_model call failed");
-
-                let (policy_arr, value_arr): (
-                    Bound<'_, PyArray<f32, Ix2>>,
-                    Bound<'_, PyArray<f32, Ix1>>,
-                ) = result
-                    .extract(py)
-                    .expect("expected (policy, value) tuple of numpy arrays");
-
-                // Copy results back to PolicyValue outputs
-                let policy = unsafe { policy_arr.as_slice().unwrap() };
-                let value = unsafe { value_arr.as_slice().unwrap() };
-
-                for (i, out) in outputs.iter_mut().enumerate() {
-                    out.policy.copy_from_slice(&policy[i * 11..(i + 1) * 11]);
-                    out.value = value[i];
-                }
+        if needs_rebuild {
+            let runner = Arc::new(ByteFightCudaGraphRunner::new(
+                py,
+                model.clone_ref(py),
+                num_batches,
+                BATCH_SIZE,
+                selfplay_precision,
+            )?);
+            *guard = Some(ByteFightGraphCacheEntry {
+                model_ptr,
+                num_batches,
+                precision: selfplay_precision.to_string(),
+                runner: runner.clone(),
             });
-        };
-
-        // Release GIL while running training, reacquire in dispatch callback.
-        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch))
+            runner
+        } else {
+            guard
+                .as_ref()
+                .expect("cached runner should exist")
+                .runner
+                .clone()
+        }
     };
+
+    let batches_dispatched_ref = batches_dispatched.clone();
+    let dispatch = move |batch_idx: usize,
+                         obs_view: ArrayView<u8, Ix3>,
+                         completion: queue::BatchCompletion<PolicyValue<11>>| {
+        batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
+        runner.dispatch_async(batch_idx, obs_view, completion);
+    };
+
+    let result =
+        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch));
 
     let stats = PyDict::new(py);
     stats.set_item("poll_rounds", result.executor.poll_rounds)?;

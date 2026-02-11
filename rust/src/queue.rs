@@ -9,6 +9,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use event_listener::Event;
 use ndarray::{Array, ArrayView, ArrayViewMut, Axis, Slice};
@@ -48,14 +49,6 @@ where
 {
     /// Monotonically increasing counter for slot assignment.
     write_ticket: AtomicU64,
-    /// Count of completed writes per batch slot.
-    /// When this reaches BATCH_SIZE, the batch is ready for GPU dispatch.
-    batch_writes: Box<[AtomicU64]>,
-
-    /// Ticket number at which each batch was completed (end of batch).
-    /// Workers check this to know if their result is ready.
-    batch_complete: Box<[AtomicU64]>,
-
     /// Number of batch slots in the ring.
     num_batches: usize,
 
@@ -66,15 +59,70 @@ where
     /// Single contiguous allocation for zero-copy batch slicing.
     observations: UnsafeCell<Array<A, D::BatchedDim>>,
 
+    state: Arc<QueueState<O>>,
+
+    /// Callback invoked when a batch is ready.
+    /// Receives the batch slot index, a view of batch observations, and a completion handle.
+    dispatch: Box<dyn Fn(usize, ArrayView<A, D::BatchedDim>, BatchCompletion<O>) + Send + Sync>,
+}
+
+struct QueueState<O>
+where
+    O: Copy + Default + Send + Sync,
+{
+    /// Count of completed writes per batch slot.
+    /// When this reaches BATCH_SIZE, the batch is ready for GPU dispatch.
+    batch_writes: Box<[AtomicU64]>,
+
+    /// Ticket number at which each batch was completed (end of batch).
+    /// Workers check this to know if their result is ready.
+    batch_complete: Box<[AtomicU64]>,
+
     /// Output buffer. Size = `total_slots`.
     outputs: Box<[UnsafeCell<O>]>,
 
     /// Event for parking threads when waiting for GPU completion.
     completion_event: Event,
+}
 
-    /// Callback invoked when a batch is ready.
-    /// Receives the batch slot index, a view of batch observations, and should fill outputs.
-    dispatch: Box<dyn Fn(usize, ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync>,
+// SAFETY: Access to queue state is synchronized via ticket ownership and atomics.
+unsafe impl<O> Send for QueueState<O> where O: Copy + Default + Send + Sync {}
+unsafe impl<O> Sync for QueueState<O> where O: Copy + Default + Send + Sync {}
+
+/// Completion handle for a dispatched batch.
+///
+/// The dispatch backend must call `complete` exactly once, either synchronously
+/// or asynchronously (e.g. from a CUDA stream callback).
+pub struct BatchCompletion<O>
+where
+    O: Copy + Default + Send + Sync,
+{
+    state: Arc<QueueState<O>>,
+    batch_idx: usize,
+    batch_start: usize,
+    batch_end_ticket: u64,
+}
+
+// SAFETY: BatchCompletion only contains an Arc and plain integers.
+unsafe impl<O> Send for BatchCompletion<O> where O: Copy + Default + Send + Sync {}
+
+impl<O> BatchCompletion<O>
+where
+    O: Copy + Default + Send + Sync,
+{
+    #[inline]
+    pub fn complete(self, outputs: &[O]) {
+        debug_assert_eq!(outputs.len(), BATCH_SIZE);
+        for (i, output) in outputs.iter().copied().enumerate() {
+            unsafe {
+                *self.state.outputs[self.batch_start + i].get() = output;
+            }
+        }
+
+        self.state.batch_complete[self.batch_idx].store(self.batch_end_ticket, Ordering::Release);
+        self.state.batch_writes[self.batch_idx].store(0, Ordering::Relaxed);
+        self.state.completion_event.notify(usize::MAX);
+    }
 }
 
 // SAFETY: The queue is designed for concurrent access:
@@ -118,7 +166,7 @@ where
     /// and should fill the outputs.
     pub fn new<F>(obs_shape: D, num_workers: usize, dispatch: F) -> Self
     where
-        F: Fn(usize, ArrayView<A, D::BatchedDim>, &mut [O]) + Send + Sync + 'static,
+        F: Fn(usize, ArrayView<A, D::BatchedDim>, BatchCompletion<O>) + Send + Sync + 'static,
     {
         let (num_batches, total_slots) = Self::compute_queue_shape(num_workers);
 
@@ -132,16 +180,19 @@ where
 
         let batch_writes = (0..num_batches).map(|_| AtomicU64::new(0)).collect();
         let batch_complete = (0..num_batches).map(|_| AtomicU64::new(0)).collect();
+        let state = Arc::new(QueueState {
+            batch_writes,
+            batch_complete,
+            outputs,
+            completion_event: Event::new(),
+        });
 
         Self {
             write_ticket: AtomicU64::new(0),
-            batch_writes,
-            batch_complete,
             num_batches,
             total_slots,
             observations: UnsafeCell::new(observations),
-            outputs,
-            completion_event: Event::new(),
+            state,
             dispatch: Box::new(dispatch),
         }
     }
@@ -180,7 +231,7 @@ where
         write_obs(slot_view);
 
         // AcqRel: Release our write, Acquire if we trigger dispatch to see others' writes
-        let writes_in_batch = self.batch_writes[batch_idx].fetch_add(1, Ordering::AcqRel) + 1;
+        let writes_in_batch = self.state.batch_writes[batch_idx].fetch_add(1, Ordering::AcqRel) + 1;
 
         // If we completed the batch, dispatch it
         if writes_in_batch == BATCH_SIZE as u64 {
@@ -204,29 +255,18 @@ where
             "batch_view should be contiguous for efficient GPU transfer"
         );
 
-        let mut outputs: Vec<O> = vec![O::default(); BATCH_SIZE];
-
-        (self.dispatch)(batch_idx, batch_view, &mut outputs);
-
-        // SAFETY: We're the only one writing outputs for this batch
-        for (i, output) in outputs.into_iter().enumerate() {
-            unsafe {
-                *self.outputs[batch_start + i].get() = output;
-            }
-        }
-
         // Calculate the batch end ticket (first ticket of next batch)
         let batch_number = trigger_ticket / BATCH_SIZE as u64;
         let batch_end_ticket = (batch_number + 1) * BATCH_SIZE as u64;
 
-        // Mark batch complete (release ensures outputs are visible)
-        self.batch_complete[batch_idx].store(batch_end_ticket, Ordering::Release);
+        let completion = BatchCompletion {
+            state: self.state.clone(),
+            batch_idx,
+            batch_start,
+            batch_end_ticket,
+        };
 
-        // Reset batch_writes for next use of this slot
-        self.batch_writes[batch_idx].store(0, Ordering::Relaxed);
-
-        // Wake all waiting threads
-        self.completion_event.notify(usize::MAX);
+        (self.dispatch)(batch_idx, batch_view, completion);
     }
 
     /// Poll for a result. Returns Some(&O) if ready, None if still pending.
@@ -235,25 +275,25 @@ where
         let batch_end_ticket = ((ticket / BATCH_SIZE as u64) + 1) * BATCH_SIZE as u64;
 
         // Check if this batch is complete
-        if self.batch_complete[batch_idx].load(Ordering::Acquire) < batch_end_ticket {
+        if self.state.batch_complete[batch_idx].load(Ordering::Acquire) < batch_end_ticket {
             return None;
         }
 
         // Batch is complete, return reference to output
         let slot_idx = (ticket as usize) % self.total_slots;
         // SAFETY: batch_complete >= batch_end_ticket means output is written and won't change
-        Some(unsafe { &*self.outputs[slot_idx].get() })
+        Some(unsafe { &*self.state.outputs[slot_idx].get() })
     }
 
     /// Get a listener for the completion event.
     /// Use this before polling to avoid missing notifications.
     pub fn listen(&self) -> event_listener::EventListener {
-        self.completion_event.listen()
+        self.state.completion_event.listen()
     }
 
     /// Wake all waiters (used for GPU completion or external cancellation).
     pub fn notify_all(&self) {
-        self.completion_event.notify(usize::MAX);
+        self.state.completion_event.notify(usize::MAX);
     }
 }
 
@@ -269,11 +309,13 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
                 // Simple transform: output = input * 2
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -295,10 +337,12 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -333,10 +377,12 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             num_jobs,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input + 1000;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -357,10 +403,12 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             BATCH_SIZE,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = *input;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -410,10 +458,12 @@ mod tests {
         let queue: Arc<GpuJobQueue<u64, Ix0, u64>> = Arc::new(GpuJobQueue::new(
             Ix0(),
             num_threads * jobs_per_thread,
-            |_batch_idx, inputs, outputs| {
+            |_batch_idx, inputs, completion| {
+                let mut outputs = vec![0u64; BATCH_SIZE];
                 for (i, input) in inputs.iter().enumerate() {
                     outputs[i] = input * 2;
                 }
+                completion.complete(&outputs);
             },
         ));
 

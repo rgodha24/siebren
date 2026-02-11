@@ -16,7 +16,7 @@ use crate::executor::{
     reset_executor_counters, take_executor_counters, Executor, ExecutorCounters,
 };
 use crate::observation_replay_buffer::ObservationReplayBuffer;
-use crate::queue::GpuJobQueue;
+use crate::queue::{BatchCompletion, GpuJobQueue};
 use crate::worker::{worker_loop, WorkerConfig};
 use crate::{BatchDim, Environment};
 
@@ -98,7 +98,8 @@ impl ExecutorCountersAtomic {
 ///
 /// The `dispatch` callback is called when a batch of observations is ready
 /// for GPU inference. It receives the queue batch slot index, a zero-copy view
-/// of the batched observations, and should fill the output policy/value pairs.
+/// of the batched observations, and a completion handle that must be completed
+/// with policy/value outputs.
 ///
 /// Workers share an atomic counter for samples collected. When the target is
 /// reached, remaining workers are cancelled via the executor. This allows
@@ -116,7 +117,7 @@ where
     F: Fn(
             usize,
             ArrayView<E::ObsElem, <E::ObsDim as BatchDim>::BatchedDim>,
-            &mut [PolicyValue<NUM_ACTIONS>],
+            BatchCompletion<PolicyValue<NUM_ACTIONS>>,
         ) + Send
         + Sync
         + 'static,

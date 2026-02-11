@@ -31,12 +31,14 @@ mod tests {
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             BATCH_SIZE,
-            move |_batch_idx, _inputs, outputs: &mut [Output]| {
+            move |_batch_idx, _inputs, completion| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
+                let mut outputs = vec![Output::default(); BATCH_SIZE];
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
                     output.value = 0.0;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -83,12 +85,14 @@ mod tests {
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             num_evals,
-            move |_batch_idx, _inputs, outputs: &mut [Output]| {
+            move |_batch_idx, _inputs, completion| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
+                let mut outputs = vec![Output::default(); BATCH_SIZE];
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
                     output.value = 0.0;
                 }
+                completion.complete(&outputs);
             },
         ));
 
@@ -133,12 +137,14 @@ mod tests {
         let queue: Arc<GpuJobQueue<i8, Ix1, Output>> = Arc::new(GpuJobQueue::new(
             TicTacToe::OBS_SHAPE,
             num_searches,
-            move |_batch_idx, _inputs, outputs: &mut [Output]| {
+            move |_batch_idx, _inputs, completion| {
                 dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
+                let mut outputs = vec![Output::default(); BATCH_SIZE];
                 for output in outputs.iter_mut() {
                     output.policy = [1.0 / 9.0; 9];
                     output.value = 0.0;
                 }
+                completion.complete(&outputs);
             },
         ));
 
