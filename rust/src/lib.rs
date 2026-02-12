@@ -232,7 +232,12 @@ typed_ephemeral_replay_buffer!(
     target_samples,
     seed,
     execute_model,
-    mcts_num_simulations = 20
+    mcts_num_simulations = 20,
+    mcts_c_puct = 1.5,
+    mcts_dirichlet_alpha = 0.3,
+    mcts_dirichlet_epsilon = 0.25,
+    temperature = 1.0,
+    exploration_moves = 30
 ))]
 fn selfplay_tictactoe_ephemeral(
     py: Python<'_>,
@@ -243,6 +248,11 @@ fn selfplay_tictactoe_ephemeral(
     seed: u64,
     execute_model: Py<PyAny>,
     mcts_num_simulations: usize,
+    mcts_c_puct: f32,
+    mcts_dirichlet_alpha: f32,
+    mcts_dirichlet_epsilon: f32,
+    temperature: f32,
+    exploration_moves: usize,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
     use mcts::MCTSConfig;
@@ -254,6 +264,26 @@ fn selfplay_tictactoe_ephemeral(
             "mcts_num_simulations must be >= 1",
         ));
     }
+    if mcts_c_puct <= 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_c_puct must be > 0",
+        ));
+    }
+    if mcts_dirichlet_alpha <= 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_dirichlet_alpha must be > 0",
+        ));
+    }
+    if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_dirichlet_epsilon must be in [0, 1]",
+        ));
+    }
+    if temperature < 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "temperature must be >= 0",
+        ));
+    }
 
     let config = TrainingConfig {
         num_threads,
@@ -263,8 +293,13 @@ fn selfplay_tictactoe_ephemeral(
         worker: WorkerConfig {
             mcts: MCTSConfig {
                 num_simulations: mcts_num_simulations,
+                c_puct: mcts_c_puct,
+                dirichlet_alpha: mcts_dirichlet_alpha,
+                dirichlet_epsilon: mcts_dirichlet_epsilon,
                 ..Default::default()
             },
+            temperature,
+            exploration_moves,
             ..Default::default()
         },
     };
@@ -338,7 +373,12 @@ fn selfplay_tictactoe_ephemeral(
     target_samples,
     seed,
     execute_model,
-    mcts_num_simulations = 20
+    mcts_num_simulations = 20,
+    mcts_c_puct = 1.5,
+    mcts_dirichlet_alpha = 0.3,
+    mcts_dirichlet_epsilon = 0.25,
+    temperature = 1.0,
+    exploration_moves = 30
 ))]
 fn selfplay_connect4_ephemeral(
     py: Python<'_>,
@@ -349,6 +389,11 @@ fn selfplay_connect4_ephemeral(
     seed: u64,
     execute_model: Py<PyAny>,
     mcts_num_simulations: usize,
+    mcts_c_puct: f32,
+    mcts_dirichlet_alpha: f32,
+    mcts_dirichlet_epsilon: f32,
+    temperature: f32,
+    exploration_moves: usize,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
     use eval::PolicyValue;
     use mcts::MCTSConfig;
@@ -360,6 +405,26 @@ fn selfplay_connect4_ephemeral(
             "mcts_num_simulations must be >= 1",
         ));
     }
+    if mcts_c_puct <= 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_c_puct must be > 0",
+        ));
+    }
+    if mcts_dirichlet_alpha <= 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_dirichlet_alpha must be > 0",
+        ));
+    }
+    if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_dirichlet_epsilon must be in [0, 1]",
+        ));
+    }
+    if temperature < 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "temperature must be >= 0",
+        ));
+    }
 
     let config = TrainingConfig {
         num_threads,
@@ -369,8 +434,13 @@ fn selfplay_connect4_ephemeral(
         worker: WorkerConfig {
             mcts: MCTSConfig {
                 num_simulations: mcts_num_simulations,
+                c_puct: mcts_c_puct,
+                dirichlet_alpha: mcts_dirichlet_alpha,
+                dirichlet_epsilon: mcts_dirichlet_epsilon,
                 ..Default::default()
             },
+            temperature,
+            exploration_moves,
             ..Default::default()
         },
     };
@@ -445,6 +515,11 @@ fn selfplay_connect4_ephemeral(
     seed,
     *,
     mcts_num_simulations = 20,
+    mcts_c_puct = 1.5,
+    mcts_dirichlet_alpha = 0.3,
+    mcts_dirichlet_epsilon = 0.25,
+    temperature = 1.0,
+    exploration_moves = 30,
     model,
     selfplay_precision = "fp32"
 ))]
@@ -456,6 +531,11 @@ fn selfplay_bytefight_ephemeral(
     target_samples: usize,
     seed: u64,
     mcts_num_simulations: usize,
+    mcts_c_puct: f32,
+    mcts_dirichlet_alpha: f32,
+    mcts_dirichlet_epsilon: f32,
+    temperature: f32,
+    exploration_moves: usize,
     model: Py<PyAny>,
     selfplay_precision: &str,
 ) -> PyResult<(usize, usize, Py<PyDict>)> {
@@ -471,6 +551,26 @@ fn selfplay_bytefight_ephemeral(
             "mcts_num_simulations must be >= 1",
         ));
     }
+    if mcts_c_puct <= 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_c_puct must be > 0",
+        ));
+    }
+    if mcts_dirichlet_alpha <= 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_dirichlet_alpha must be > 0",
+        ));
+    }
+    if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "mcts_dirichlet_epsilon must be in [0, 1]",
+        ));
+    }
+    if temperature < 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "temperature must be >= 0",
+        ));
+    }
 
     let config = TrainingConfig {
         num_threads,
@@ -480,8 +580,13 @@ fn selfplay_bytefight_ephemeral(
         worker: WorkerConfig {
             mcts: MCTSConfig {
                 num_simulations: mcts_num_simulations,
+                c_puct: mcts_c_puct,
+                dirichlet_alpha: mcts_dirichlet_alpha,
+                dirichlet_epsilon: mcts_dirichlet_epsilon,
                 ..Default::default()
             },
+            temperature,
+            exploration_moves,
             ..Default::default()
         },
     };

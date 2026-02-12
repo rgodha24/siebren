@@ -28,7 +28,7 @@ from siebren import (
 @dataclass
 class TrainConfig:
     game: str = "bytefight"
-    epochs: int = 100
+    epochs: int = 300
     samples_per_epoch: int = 1_000_000
     train_batch_size: int = 2048
     train_steps_per_epoch: int = 512
@@ -37,11 +37,18 @@ class TrainConfig:
     value_loss_weight: float = 2.0
     l2_weight: float = 1e-4
     num_threads: int = 32
-    workers_per_thread: int = 32
+    workers_per_thread: int = 96
+    hidden_dim: Optional[int] = None
     mcts_num_simulations: int = 64
+    mcts_c_puct: float = 1.5
+    mcts_dirichlet_alpha: float = 0.3
+    mcts_dirichlet_epsilon: float = 0.25
+    selfplay_temperature: float = 1.0
+    selfplay_exploration_moves: int = 30
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     wandb_project: str = "siebren"
+    run_name: Optional[str] = None
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 10
     resume: Optional[str] = None
@@ -51,7 +58,7 @@ class TrainConfig:
     cudagraphs: bool = False
     selfplay_backend: str = "rust-cudagraph"
     inference_cuda_graph: bool = True
-    selfplay_precision: str = "fp32"
+    selfplay_precision: str = "fp16"
     matmul_precision: str = "high"
 
 
@@ -123,7 +130,7 @@ class Connect4Net(nn.Module):
 class ByteFightNet(nn.Module):
     """MLP for ByteFight bitpacked 16x16 observations (~100k params)."""
 
-    def __init__(self, hidden_dim: int = 48):
+    def __init__(self, hidden_dim: int = 64):
         super().__init__()
         self.register_buffer(
             "_bit_shifts",
@@ -493,12 +500,13 @@ def train_step(
 def train(config: TrainConfig):
     """Main training loop."""
     default_run_name = f"{config.game}-{time.strftime('%Y%m%d-%H%M%S')}"
+    run_name = config.run_name or default_run_name
 
     # Initialize wandb
     run = wandb.init(
         project=config.wandb_project,
         config=vars(config),
-        name=default_run_name,
+        name=run_name,
     )
 
     run_name = run.name if run is not None and run.name else default_run_name
@@ -511,13 +519,16 @@ def train(config: TrainConfig):
 
     # Setup model and action space based on game
     if config.game == "tictactoe":
-        model = TicTacToeNet().to(config.device)
+        hidden_dim = config.hidden_dim if config.hidden_dim is not None else 128
+        model = TicTacToeNet(hidden_dim=hidden_dim).to(config.device)
         num_actions = 9
     elif config.game == "connect4":
-        model = Connect4Net().to(config.device)
+        channels = config.hidden_dim if config.hidden_dim is not None else 64
+        model = Connect4Net(channels=channels).to(config.device)
         num_actions = 7
     elif config.game == "bytefight":
-        model = ByteFightNet().to(config.device)
+        hidden_dim = config.hidden_dim if config.hidden_dim is not None else 64
+        model = ByteFightNet(hidden_dim=hidden_dim).to(config.device)
         num_actions = 11
     else:
         raise ValueError(f"Unknown game: {config.game}")
@@ -527,6 +538,11 @@ def train(config: TrainConfig):
         num_threads=config.num_threads,
         workers_per_thread=config.workers_per_thread,
         mcts_num_simulations=config.mcts_num_simulations,
+        mcts_c_puct=config.mcts_c_puct,
+        mcts_dirichlet_alpha=config.mcts_dirichlet_alpha,
+        mcts_dirichlet_epsilon=config.mcts_dirichlet_epsilon,
+        temperature=config.selfplay_temperature,
+        exploration_moves=config.selfplay_exploration_moves,
         seed=config.seed,
     )
     replay_buffer = EphemeralReplayBuffer(
@@ -648,6 +664,11 @@ def train(config: TrainConfig):
             "selfplay/games_completed": games_completed,
             "selfplay/samples_collected": samples_collected,
             "selfplay/mcts_num_simulations": config.mcts_num_simulations,
+            "selfplay/mcts_c_puct": config.mcts_c_puct,
+            "selfplay/mcts_dirichlet_alpha": config.mcts_dirichlet_alpha,
+            "selfplay/mcts_dirichlet_epsilon": config.mcts_dirichlet_epsilon,
+            "selfplay/temperature": config.selfplay_temperature,
+            "selfplay/exploration_moves": config.selfplay_exploration_moves,
             "selfplay/moves_per_game": moves_per_game,
             "selfplay/batches": dispatch_batches,
             "selfplay/time_sec": selfplay_time,
@@ -768,7 +789,7 @@ def main():
         choices=["tictactoe", "connect4", "bytefight"],
         help="Game to train on",
     )
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=300, help="Number of epochs")
     parser.add_argument(
         "--samples-per-epoch",
         type=int,
@@ -807,13 +828,52 @@ def main():
         "--num-threads", type=int, default=32, help="Number of worker threads"
     )
     parser.add_argument(
-        "--workers-per-thread", type=int, default=32, help="Workers per thread"
+        "--workers-per-thread", type=int, default=96, help="Workers per thread"
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help=(
+            "Model width override. Uses game defaults when omitted "
+            "(TicTacToe=128, Connect4=64 channels, ByteFight=64)."
+        ),
     )
     parser.add_argument(
         "--mcts-num-simulations",
         type=int,
         default=64,
         help="MCTS simulations per move during self-play",
+    )
+    parser.add_argument(
+        "--mcts-c-puct",
+        type=float,
+        default=1.5,
+        help="PUCT exploration constant",
+    )
+    parser.add_argument(
+        "--mcts-dirichlet-alpha",
+        type=float,
+        default=0.3,
+        help="Dirichlet alpha for root noise",
+    )
+    parser.add_argument(
+        "--mcts-dirichlet-epsilon",
+        type=float,
+        default=0.25,
+        help="Root noise mixing weight in [0, 1]",
+    )
+    parser.add_argument(
+        "--selfplay-temperature",
+        type=float,
+        default=1.0,
+        help="Move sampling temperature before greedy phase",
+    )
+    parser.add_argument(
+        "--selfplay-exploration-moves",
+        type=int,
+        default=30,
+        help="Number of opening moves that use sampling temperature",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -824,6 +884,12 @@ def main():
     )
     parser.add_argument(
         "--wandb-project", type=str, default="siebren", help="W&B project name"
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Optional explicit W&B run name",
     )
     parser.add_argument(
         "--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory"
@@ -883,7 +949,7 @@ def main():
     parser.add_argument(
         "--selfplay-precision",
         type=str,
-        default="fp32",
+        default="fp16",
         choices=["fp32", "fp16", "bf16"],
         help="Precision for self-play model inference",
     )
@@ -909,10 +975,17 @@ def main():
         l2_weight=args.l2_weight,
         num_threads=args.num_threads,
         workers_per_thread=args.workers_per_thread,
+        hidden_dim=args.hidden_dim,
         mcts_num_simulations=args.mcts_num_simulations,
+        mcts_c_puct=args.mcts_c_puct,
+        mcts_dirichlet_alpha=args.mcts_dirichlet_alpha,
+        mcts_dirichlet_epsilon=args.mcts_dirichlet_epsilon,
+        selfplay_temperature=args.selfplay_temperature,
+        selfplay_exploration_moves=args.selfplay_exploration_moves,
         seed=args.seed,
         device=args.device,
         wandb_project=args.wandb_project,
+        run_name=args.run_name,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,

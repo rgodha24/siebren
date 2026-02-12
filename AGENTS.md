@@ -2,6 +2,8 @@
 
 AlphaZero-style game engine training infrastructure. Rust core with Python bindings via PyO3/maturin.
 
+FUCK BACKWARDS COMPAT. DO NOT CARE ABOUT IT.
+
 ## Quick Reference
 
 ```bash

@@ -21,6 +21,11 @@ class SelfPlay:
         num_threads: int = 32,
         workers_per_thread: int = 256,
         mcts_num_simulations: int = 20,
+        mcts_c_puct: float = 1.5,
+        mcts_dirichlet_alpha: float = 0.3,
+        mcts_dirichlet_epsilon: float = 0.25,
+        temperature: float = 1.0,
+        exploration_moves: int = 30,
         seed: int = 42,
     ) -> None:
         self.game = _normalize_game(game)
@@ -32,9 +37,25 @@ class SelfPlay:
         assert mcts_num_simulations > 0, (
             f"mcts_num_simulations must be >= 1, got {mcts_num_simulations}"
         )
+        assert mcts_c_puct > 0.0, f"mcts_c_puct must be > 0, got {mcts_c_puct}"
+        assert mcts_dirichlet_alpha > 0.0, (
+            f"mcts_dirichlet_alpha must be > 0, got {mcts_dirichlet_alpha}"
+        )
+        assert 0.0 <= mcts_dirichlet_epsilon <= 1.0, (
+            f"mcts_dirichlet_epsilon must be in [0, 1], got {mcts_dirichlet_epsilon}"
+        )
+        assert temperature >= 0.0, f"temperature must be >= 0, got {temperature}"
+        assert exploration_moves >= 0, (
+            f"exploration_moves must be >= 0, got {exploration_moves}"
+        )
         self.num_threads = num_threads
         self.workers_per_thread = workers_per_thread
         self.mcts_num_simulations = mcts_num_simulations
+        self.mcts_c_puct = mcts_c_puct
+        self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
+        self.mcts_dirichlet_epsilon = mcts_dirichlet_epsilon
+        self.temperature = temperature
+        self.exploration_moves = exploration_moves
         self.seed = seed
 
     def play_games(
@@ -68,6 +89,11 @@ class SelfPlay:
                 num_samples,
                 self.seed,
                 mcts_num_simulations=self.mcts_num_simulations,
+                mcts_c_puct=self.mcts_c_puct,
+                mcts_dirichlet_alpha=self.mcts_dirichlet_alpha,
+                mcts_dirichlet_epsilon=self.mcts_dirichlet_epsilon,
+                temperature=self.temperature,
+                exploration_moves=self.exploration_moves,
                 model=model,
                 selfplay_precision=selfplay_precision,
             )
@@ -88,4 +114,9 @@ class SelfPlay:
             self.seed,
             execute_model,
             mcts_num_simulations=self.mcts_num_simulations,
+            mcts_c_puct=self.mcts_c_puct,
+            mcts_dirichlet_alpha=self.mcts_dirichlet_alpha,
+            mcts_dirichlet_epsilon=self.mcts_dirichlet_epsilon,
+            temperature=self.temperature,
+            exploration_moves=self.exploration_moves,
         )
