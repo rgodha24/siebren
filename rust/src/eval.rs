@@ -241,11 +241,11 @@ mod tests {
 
         let executor = Executor::new(|| queue.listen());
         executor.run(
-            futures
+            &mut futures
                 .into_iter()
                 .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
                 .collect(),
-            || false,
+            &mut || false,
         );
 
         assert_eq!(results.get(), BATCH_SIZE);

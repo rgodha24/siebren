@@ -63,11 +63,11 @@ mod tests {
             .collect();
 
         executor.run(
-            futures
+            &mut futures
                 .into_iter()
                 .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
                 .collect(),
-            || false,
+            &mut || false,
         );
 
         assert_eq!(*completed.borrow(), BATCH_SIZE);
@@ -115,11 +115,11 @@ mod tests {
             .collect();
 
         executor.run(
-            futures
+            &mut futures
                 .into_iter()
                 .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
                 .collect(),
-            || false,
+            &mut || false,
         );
 
         assert_eq!(*completed.borrow(), num_evals);
@@ -175,11 +175,11 @@ mod tests {
             .collect();
 
         executor.run(
-            futures
+            &mut futures
                 .into_iter()
                 .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
                 .collect(),
-            || false,
+            &mut || false,
         );
 
         assert_eq!(*completed.borrow(), num_searches);
@@ -234,11 +234,11 @@ mod tests {
             .collect();
 
         executor.run(
-            futures
+            &mut futures
                 .into_iter()
                 .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
                 .collect(),
-            || false,
+            &mut || false,
         );
 
         let completed_games = games_completed.load(Ordering::Relaxed);
@@ -308,14 +308,14 @@ mod tests {
                         .collect();
 
                     executor.run(
-                        futures
+                        &mut futures
                             .into_iter()
                             .map(|f| {
                                 Box::pin(f)
                                     as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
                             })
                             .collect(),
-                        || false,
+                        &mut || false,
                     );
                 });
             }
@@ -328,5 +328,167 @@ mod tests {
         assert!(collected_samples >= TARGET_SAMPLES);
         assert!(completed_games >= 30); // At least ~30 games to get 200 samples
         assert_eq!(replay_buffer.len(), collected_samples);
+    }
+
+    /// Test persistent SelfPlaySession: wait_for(a), then wait_for(a+b).
+    /// Verifies monotonic samples and stable operation across waits.
+    #[test]
+    fn test_session_wait_for_monotonic() {
+        use crate::eval::PolicyValue;
+        use crate::training::{SelfPlaySession, SessionConfig};
+
+        type Output = PolicyValue<9>;
+        let replay_buffer = Arc::new(ObservationReplayBuffer::<i8, Ix1, 9>::new(
+            10000,
+            TicTacToe::OBS_SHAPE,
+        ));
+
+        let config = SessionConfig {
+            num_threads: 2,
+            workers_per_thread: BATCH_SIZE / 2,
+            worker: WorkerConfig {
+                mcts: MCTSConfig {
+                    num_simulations: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            seed: 42,
+        };
+
+        // Use SyncEvaluator-style dispatch: uniform policy, zero value.
+        let dispatch = |_batch_idx: usize,
+                        _inputs: ndarray::ArrayView<i8, ndarray::Ix2>,
+                        completion: crate::queue::BatchCompletion<Output>| {
+            let mut outputs = vec![Output::default(); BATCH_SIZE];
+            for output in outputs.iter_mut() {
+                output.policy = [1.0 / 9.0; 9];
+                output.value = 0.0;
+            }
+            completion.complete(&outputs);
+        };
+
+        let mut session =
+            SelfPlaySession::new::<TicTacToe, 9, _>(config, replay_buffer.clone(), dispatch);
+
+        // First wait: collect at least 100 samples.
+        let target_a = 100;
+        let reached_a = session.wait_for(target_a);
+        assert!(
+            reached_a >= target_a,
+            "expected >= {target_a} samples, got {reached_a}"
+        );
+
+        // Second wait: collect more samples (absolute target).
+        let target_b = reached_a + 100;
+        let reached_b = session.wait_for(target_b);
+        assert!(
+            reached_b >= target_b,
+            "expected >= {target_b} samples, got {reached_b}"
+        );
+        assert!(
+            reached_b >= reached_a,
+            "samples must be monotonic: {reached_b} < {reached_a}"
+        );
+
+        // Replay buffer length should match total samples.
+        assert_eq!(
+            replay_buffer.len(),
+            reached_b,
+            "replay buffer len should match samples collected"
+        );
+
+        session.shutdown();
+    }
+
+    /// Test that drop during paused and running states doesn't deadlock.
+    #[test]
+    fn test_session_drop_while_paused() {
+        use crate::eval::PolicyValue;
+        use crate::training::{SelfPlaySession, SessionConfig};
+
+        type Output = PolicyValue<9>;
+        let replay_buffer = Arc::new(ObservationReplayBuffer::<i8, Ix1, 9>::new(
+            1000,
+            TicTacToe::OBS_SHAPE,
+        ));
+
+        let config = SessionConfig {
+            num_threads: 2,
+            workers_per_thread: BATCH_SIZE / 2,
+            worker: WorkerConfig {
+                mcts: MCTSConfig {
+                    num_simulations: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            seed: 42,
+        };
+
+        let dispatch = |_batch_idx: usize,
+                        _inputs: ndarray::ArrayView<i8, ndarray::Ix2>,
+                        completion: crate::queue::BatchCompletion<Output>| {
+            let mut outputs = vec![Output::default(); BATCH_SIZE];
+            for output in outputs.iter_mut() {
+                output.policy = [1.0 / 9.0; 9];
+                output.value = 0.0;
+            }
+            completion.complete(&outputs);
+        };
+
+        // Create session, wait for some samples, then drop.
+        // Should not deadlock.
+        let mut session =
+            SelfPlaySession::new::<TicTacToe, 9, _>(config, replay_buffer.clone(), dispatch);
+        session.wait_for(50);
+        session.shutdown();
+        // If we reach here, no deadlock.
+    }
+
+    /// Test that drop during running state doesn't deadlock.
+    #[test]
+    fn test_session_drop_while_running() {
+        use crate::eval::PolicyValue;
+        use crate::training::{SelfPlaySession, SessionConfig};
+
+        type Output = PolicyValue<9>;
+        let replay_buffer = Arc::new(ObservationReplayBuffer::<i8, Ix1, 9>::new(
+            1000,
+            TicTacToe::OBS_SHAPE,
+        ));
+
+        let config = SessionConfig {
+            num_threads: 2,
+            workers_per_thread: BATCH_SIZE / 2,
+            worker: WorkerConfig {
+                mcts: MCTSConfig {
+                    num_simulations: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            seed: 42,
+        };
+
+        let dispatch = |_batch_idx: usize,
+                        _inputs: ndarray::ArrayView<i8, ndarray::Ix2>,
+                        completion: crate::queue::BatchCompletion<Output>| {
+            let mut outputs = vec![Output::default(); BATCH_SIZE];
+            for output in outputs.iter_mut() {
+                output.policy = [1.0 / 9.0; 9];
+                output.value = 0.0;
+            }
+            completion.complete(&outputs);
+        };
+
+        let mut session =
+            SelfPlaySession::new::<TicTacToe, 9, _>(config, replay_buffer.clone(), dispatch);
+        // Start without wait_for -- workers are actively running.
+        session.start();
+        // Give threads a moment to actually start polling.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Drop should shut down cleanly without deadlock.
+        session.shutdown();
     }
 }

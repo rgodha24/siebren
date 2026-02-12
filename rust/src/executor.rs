@@ -4,7 +4,6 @@
 //! requests. It doesn't use wakers - instead, it polls all futures in a tight
 //! loop and parks when no progress is made.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -12,87 +11,6 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use event_listener::{EventListener, Listener};
 
 use crate::future::{signal_progress, take_progress};
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ExecutorCounters {
-    pub poll_rounds: u64,
-    pub futures_polled: u64,
-    pub poll_ready: u64,
-    pub poll_pending: u64,
-    pub wait_count: u64,
-}
-
-thread_local! {
-    static EXEC_POLL_ROUNDS: Cell<u64> = Cell::new(0);
-    static EXEC_FUTURES_POLLED: Cell<u64> = Cell::new(0);
-    static EXEC_POLL_READY: Cell<u64> = Cell::new(0);
-    static EXEC_POLL_PENDING: Cell<u64> = Cell::new(0);
-    static EXEC_WAIT_COUNT: Cell<u64> = Cell::new(0);
-}
-
-fn inc_poll_round() {
-    EXEC_POLL_ROUNDS.with(|c| c.set(c.get() + 1));
-}
-
-fn inc_future_polled() {
-    EXEC_FUTURES_POLLED.with(|c| c.set(c.get() + 1));
-}
-
-fn inc_poll_ready() {
-    EXEC_POLL_READY.with(|c| c.set(c.get() + 1));
-}
-
-fn inc_poll_pending() {
-    EXEC_POLL_PENDING.with(|c| c.set(c.get() + 1));
-}
-
-fn inc_wait() {
-    EXEC_WAIT_COUNT.with(|c| c.set(c.get() + 1));
-}
-
-pub fn reset_executor_counters() {
-    EXEC_POLL_ROUNDS.with(|c| c.set(0));
-    EXEC_FUTURES_POLLED.with(|c| c.set(0));
-    EXEC_POLL_READY.with(|c| c.set(0));
-    EXEC_POLL_PENDING.with(|c| c.set(0));
-    EXEC_WAIT_COUNT.with(|c| c.set(0));
-}
-
-pub fn take_executor_counters() -> ExecutorCounters {
-    let poll_rounds = EXEC_POLL_ROUNDS.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    });
-    let futures_polled = EXEC_FUTURES_POLLED.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    });
-    let poll_ready = EXEC_POLL_READY.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    });
-    let poll_pending = EXEC_POLL_PENDING.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    });
-    let wait_count = EXEC_WAIT_COUNT.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    });
-
-    ExecutorCounters {
-        poll_rounds,
-        futures_polled,
-        poll_ready,
-        poll_pending,
-        wait_count,
-    }
-}
 
 /// Create a dummy waker that does nothing.
 /// We don't use wakers for signaling - we use event_listener + progress tracking.
@@ -138,9 +56,11 @@ impl<'a> Executor<'a> {
     /// Polls all futures in round-robin. When no future makes progress,
     /// parks until the GPU signals batch completion.
     ///
-    /// If `cancel()` returns true at any checkpoint, all remaining futures are
-    /// dropped and the function returns immediately.
-    pub fn run<F, C>(&self, mut futures: Vec<Pin<Box<F>>>, mut cancel: C)
+    /// Completed futures are removed (swap_remove). Pending futures remain
+    /// alive in the vec. Returns when `cancel()` returns true or all futures
+    /// complete. This allows preserving in-progress game state across
+    /// pause/resume cycles.
+    pub fn run<F, C>(&self, futures: &mut Vec<Pin<Box<F>>>, cancel: &mut C)
     where
         F: Future<Output = ()> + ?Sized,
         C: FnMut() -> bool,
@@ -159,19 +79,15 @@ impl<'a> Executor<'a> {
                 take_progress();
 
                 // Poll all pending futures
-                inc_poll_round();
                 let mut i = 0;
                 while i < futures.len() {
                     let poll_result = futures[i].as_mut().poll(&mut cx);
-                    inc_future_polled();
                     match poll_result {
                         Poll::Ready(()) => {
-                            inc_poll_ready();
                             futures.swap_remove(i);
                             signal_progress();
                         }
                         Poll::Pending => {
-                            inc_poll_pending();
                             i += 1;
                         }
                     }
@@ -192,19 +108,15 @@ impl<'a> Executor<'a> {
 
             // Double-check before parking and re-evaluate cancellation.
             take_progress();
-            inc_poll_round();
             let mut i = 0;
             while i < futures.len() {
                 let poll_result = futures[i].as_mut().poll(&mut cx);
-                inc_future_polled();
                 match poll_result {
                     Poll::Ready(()) => {
-                        inc_poll_ready();
                         futures.swap_remove(i);
                         signal_progress();
                     }
                     Poll::Pending => {
-                        inc_poll_pending();
                         i += 1;
                     }
                 }
@@ -215,7 +127,6 @@ impl<'a> Executor<'a> {
             }
 
             if !take_progress() {
-                inc_wait();
                 listener.wait();
             }
         }
@@ -266,7 +177,7 @@ mod tests {
         };
 
         let executor = Executor::new(|| event_listener::Event::new().listen());
-        executor.run(vec![Box::pin(fut)], || false);
+        executor.run(&mut vec![Box::pin(fut)], &mut || false);
 
         assert!(completed.get());
     }
@@ -275,7 +186,7 @@ mod tests {
     fn test_executor_runs_multiple_futures() {
         let count = Rc::new(Cell::new(0));
 
-        let futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..10)
+        let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..10)
             .map(|_| {
                 let count = count.clone();
                 let fut = async move {
@@ -286,7 +197,7 @@ mod tests {
             .collect();
 
         let executor = Executor::new(|| event_listener::Event::new().listen());
-        executor.run(futures, || false);
+        executor.run(&mut futures, &mut || false);
 
         assert_eq!(count.get(), 10);
     }
@@ -319,7 +230,7 @@ mod tests {
             }
         });
 
-        executor.run(vec![Box::pin(fut)], || {
+        executor.run(&mut vec![Box::pin(fut)], &mut || {
             cancelled_clone.load(Ordering::Relaxed)
         });
     }
@@ -328,7 +239,7 @@ mod tests {
     fn test_executor_handles_multi_poll_futures() {
         let completed = Rc::new(Cell::new(0));
 
-        let futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..5)
+        let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..5)
             .map(|i| {
                 let completed = completed.clone();
                 let countdown = CountdownFuture::new(i + 1);
@@ -354,7 +265,7 @@ mod tests {
             .collect();
 
         let executor = Executor::new(|| event_listener::Event::new().listen());
-        executor.run(futures, || false);
+        executor.run(&mut futures, &mut || false);
 
         assert_eq!(completed.get(), 5);
     }
@@ -395,9 +306,114 @@ mod tests {
         });
 
         let executor = Executor::new(move || event.listen());
-        executor.run(vec![Box::pin(fut)], || false);
+        executor.run(&mut vec![Box::pin(fut)], &mut || false);
 
         notify_thread.join().unwrap();
         assert!(completed.get());
+    }
+
+    #[test]
+    fn test_run_preserves_futures() {
+        // Test that run does NOT drop pending futures.
+        // We use futures that always signal progress and complete after enough polls.
+        // Cancel immediately on first check to guarantee futures are still pending.
+
+        let completed = Rc::new(Cell::new(0usize));
+
+        let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..3)
+            .map(|_| {
+                let completed = completed.clone();
+                let polls = Cell::new(0usize);
+                let fut = std::future::poll_fn(move |_cx| {
+                    let p = polls.get();
+                    polls.set(p + 1);
+                    signal_progress();
+                    if p >= 10 {
+                        completed.set(completed.get() + 1);
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                });
+                Box::pin(fut) as Pin<Box<dyn Future<Output = ()>>>
+            })
+            .collect();
+
+        let executor = Executor::new(|| event_listener::Event::new().listen());
+
+        // Cancel immediately - futures should not be polled at all.
+        executor.run(&mut futures, &mut || true);
+
+        // Futures should still be alive (cancel was true from the start).
+        assert_eq!(
+            futures.len(),
+            3,
+            "all futures must be preserved when cancel is immediate"
+        );
+        assert_eq!(completed.get(), 0, "no futures should have completed");
+
+        // Now let them finish.
+        executor.run(&mut futures, &mut || false);
+
+        assert_eq!(completed.get(), 3, "all futures should have completed");
+        assert!(futures.is_empty(), "completed futures should be removed");
+    }
+
+    #[test]
+    fn test_run_does_not_drop_pending() {
+        // Verify a future's drop impl is NOT called between run calls.
+
+        let was_dropped = Rc::new(Cell::new(false));
+        let was_dropped_clone = was_dropped.clone();
+
+        struct DropDetector {
+            flag: Rc<Cell<bool>>,
+            polls: Cell<usize>,
+        }
+        impl Drop for DropDetector {
+            fn drop(&mut self) {
+                self.flag.set(true);
+            }
+        }
+        impl Future for DropDetector {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let this = unsafe { self.get_unchecked_mut() };
+                let p = this.polls.get();
+                this.polls.set(p + 1);
+                signal_progress();
+                if p >= 5 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![Box::pin(DropDetector {
+            flag: was_dropped_clone,
+            polls: Cell::new(0),
+        })];
+
+        let executor = Executor::new(|| event_listener::Event::new().listen());
+
+        // Cancel immediately
+        executor.run(&mut futures, &mut || true);
+
+        // The future should NOT have been dropped
+        assert!(
+            !was_dropped.get(),
+            "future must not be dropped between run calls"
+        );
+        assert_eq!(futures.len(), 1, "future should still be in the vec");
+
+        // Now let it finish
+        executor.run(&mut futures, &mut || false);
+
+        assert!(futures.is_empty());
+        assert!(
+            was_dropped.get(),
+            "future should be dropped after completion"
+        );
     }
 }

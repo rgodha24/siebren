@@ -1,16 +1,19 @@
 import importlib
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
 
-from .replay_buffer import EphemeralReplayBuffer, ReplayBuffer, _normalize_game
+from .replay_buffer import EphemeralReplayBuffer, _normalize_game
 
 _native = importlib.import_module("siebren.siebren")
 
 
 class SelfPlay:
-    """Unified self-play runner for all supported games.
+    """Persistent self-play session for all supported games.
+
+    Wraps a native Rust session that preserves in-progress games across
+    pause/resume boundaries.
 
     IMPORTANT: num_threads * workers_per_thread must be >= 256 (the batch size).
     """
@@ -18,6 +21,8 @@ class SelfPlay:
     def __init__(
         self,
         game: str,
+        replay_buffer: EphemeralReplayBuffer,
+        *,
         num_threads: int = 32,
         workers_per_thread: int = 256,
         mcts_num_simulations: int = 20,
@@ -27,6 +32,14 @@ class SelfPlay:
         temperature: float = 1.0,
         exploration_moves: int = 30,
         seed: int = 42,
+        execute_model: Optional[
+            Callable[
+                [npt.NDArray[np.generic]],
+                Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
+            ]
+        ] = None,
+        model: Optional[Any] = None,
+        selfplay_precision: str = "fp32",
     ) -> None:
         self.game = _normalize_game(game)
         total_workers = num_threads * workers_per_thread
@@ -48,75 +61,71 @@ class SelfPlay:
         assert exploration_moves >= 0, (
             f"exploration_moves must be >= 0, got {exploration_moves}"
         )
-        self.num_threads = num_threads
-        self.workers_per_thread = workers_per_thread
-        self.mcts_num_simulations = mcts_num_simulations
-        self.mcts_c_puct = mcts_c_puct
-        self.mcts_dirichlet_alpha = mcts_dirichlet_alpha
-        self.mcts_dirichlet_epsilon = mcts_dirichlet_epsilon
-        self.temperature = temperature
-        self.exploration_moves = exploration_moves
-        self.seed = seed
-
-    def play_games(
-        self,
-        replay_buffer: ReplayBuffer,
-        num_samples: int,
-        execute_model: Optional[
-            Callable[
-                [npt.NDArray[np.generic]],
-                Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]],
-            ]
-        ] = None,
-        *,
-        use_rust_cudagraph: bool = False,
-        model: Optional[Any] = None,
-        selfplay_precision: str = "fp32",
-    ) -> Tuple[int, int, Dict[str, int]]:
-        """Run self-play games and return (games_completed, samples_collected, executor_counters)."""
         assert replay_buffer.game == self.game
-        assert isinstance(replay_buffer, EphemeralReplayBuffer)
 
         if self.game == "bytefight":
             if model is None:
                 raise ValueError(
                     "bytefight self-play requires a CUDA model for rust-cudagraph backend"
                 )
-            return _native.selfplay_bytefight_ephemeral(
+            self._session = _native.ByteFightSelfPlay(
                 replay_buffer._inner,
-                self.num_threads,
-                self.workers_per_thread,
-                num_samples,
-                self.seed,
-                mcts_num_simulations=self.mcts_num_simulations,
-                mcts_c_puct=self.mcts_c_puct,
-                mcts_dirichlet_alpha=self.mcts_dirichlet_alpha,
-                mcts_dirichlet_epsilon=self.mcts_dirichlet_epsilon,
-                temperature=self.temperature,
-                exploration_moves=self.exploration_moves,
+                num_threads,
+                workers_per_thread,
+                seed,
+                mcts_num_simulations=mcts_num_simulations,
+                mcts_c_puct=mcts_c_puct,
+                mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                mcts_dirichlet_epsilon=mcts_dirichlet_epsilon,
+                temperature=temperature,
+                exploration_moves=exploration_moves,
                 model=model,
                 selfplay_precision=selfplay_precision,
             )
+        else:
+            if execute_model is None:
+                raise ValueError("execute_model callback is required for this game")
+            cls = {
+                "tictactoe": _native.TicTacToeSelfPlay,
+                "connect4": _native.Connect4SelfPlay,
+            }[self.game]
+            self._session = cls(
+                replay_buffer._inner,
+                num_threads,
+                workers_per_thread,
+                seed,
+                execute_model,
+                mcts_num_simulations=mcts_num_simulations,
+                mcts_c_puct=mcts_c_puct,
+                mcts_dirichlet_alpha=mcts_dirichlet_alpha,
+                mcts_dirichlet_epsilon=mcts_dirichlet_epsilon,
+                temperature=temperature,
+                exploration_moves=exploration_moves,
+            )
 
-        if execute_model is None:
-            raise ValueError("execute_model callback is required for this game")
+    def start(self) -> None:
+        """Start self-play with no sample limit."""
+        self._session.start()
 
-        fn = {
-            "tictactoe": _native.selfplay_tictactoe_ephemeral,
-            "connect4": _native.selfplay_connect4_ephemeral,
-        }[self.game]
+    def wait_for(self, target_samples: int) -> int:
+        """Block until absolute target_samples is reached, then pause and quiesce.
 
-        return fn(
-            replay_buffer._inner,
-            self.num_threads,
-            self.workers_per_thread,
-            num_samples,
-            self.seed,
-            execute_model,
-            mcts_num_simulations=self.mcts_num_simulations,
-            mcts_c_puct=self.mcts_c_puct,
-            mcts_dirichlet_alpha=self.mcts_dirichlet_alpha,
-            mcts_dirichlet_epsilon=self.mcts_dirichlet_epsilon,
-            temperature=self.temperature,
-            exploration_moves=self.exploration_moves,
-        )
+        Returns the actual number of samples collected (may exceed target).
+        After this returns, it is safe to read the replay buffer.
+        """
+        return self._session.wait_for(target_samples)
+
+    def samples(self) -> int:
+        """Return the current absolute sample count."""
+        return self._session.samples()
+
+    def drop(self) -> None:
+        """Shut down the session. Idempotent."""
+        self._session.drop()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup."""
+        try:
+            self._session.drop()
+        except Exception:
+            pass

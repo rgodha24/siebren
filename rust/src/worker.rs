@@ -191,6 +191,47 @@ pub async fn worker_loop<E, V, R, const NUM_ACTIONS: usize>(
     }
 }
 
+/// Run a worker loop that plays games forever.
+///
+/// Unlike `worker_loop`, this never self-terminates based on a sample count.
+/// Stopping is handled externally by the executor's cancel/pause mechanism.
+/// This is used by the persistent `SelfPlaySession` where pause/resume is
+/// controlled at the session level, not inside the worker.
+///
+/// Samples are pushed directly to the shared `replay_buffer` after each completed game.
+pub async fn worker_loop_forever<E, V, R, const NUM_ACTIONS: usize>(
+    evaluator: &V,
+    config: &WorkerConfig,
+    rng: &mut R,
+    samples_collected: Arc<AtomicUsize>,
+    games_completed: Arc<AtomicUsize>,
+    replay_buffer: &ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>,
+) where
+    E: Environment + Clone,
+    V: Evaluator<E>,
+    R: Rng,
+{
+    debug_assert_eq!(NUM_ACTIONS, E::NUM_ACTIONS);
+
+    loop {
+        let game = play_game::<E, V, R>(evaluator, config, rng).await;
+        let num_samples = game.samples.len();
+
+        // Push observations, policies, and values to replay buffer.
+        let mut guard = replay_buffer.reserve(num_samples);
+        let mut env = game.initial_env;
+        for sample in game.samples {
+            guard.push_with_observation(&sample.policy, sample.value, |out| env.observation(out));
+            let action =
+                E::Action::from_index(sample.action_idx).expect("invalid action index in replay");
+            env.apply_action(action);
+        }
+
+        samples_collected.fetch_add(num_samples, Ordering::AcqRel);
+        games_completed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,7 +269,7 @@ mod tests {
 
         let event = event_listener::Event::new();
         let executor = Executor::new(|| event.listen());
-        executor.run(vec![Box::pin(fut)], || false);
+        executor.run(&mut vec![Box::pin(fut)], &mut || false);
 
         let game = result.borrow_mut().take().unwrap();
         let samples = game.samples;

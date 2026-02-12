@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::{fmt::Debug, hash::Hash};
@@ -6,7 +5,6 @@ use std::{fmt::Debug, hash::Hash};
 use ndarray::{ArrayView, ArrayViewMut, Dimension, Ix0, Ix1, Ix2, Ix3, Ix4, Ix5, Ix6, RemoveAxis};
 use numpy::{PyArray, PyArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -220,453 +218,427 @@ typed_ephemeral_replay_buffer!(
     7
 );
 
-/// Run TicTacToe self-play with Python model callback.
-///
-/// The callback receives observations as a (BATCH_SIZE, 9) int8 numpy array.
-/// Board encoding: 0 = empty, 1 = PlayerA (X), -1 = PlayerB (O)
-///
-/// Returns (policy, value) tuple where:
-/// - policy: (BATCH_SIZE, 9) float32 - action probabilities
-/// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
-#[pyfunction]
-#[pyo3(signature = (
-    replay_buffer,
-    num_threads,
-    workers_per_thread,
-    target_samples,
-    seed,
-    execute_model,
-    mcts_num_simulations = 20,
-    mcts_c_puct = 1.5,
-    mcts_dirichlet_alpha = 0.3,
-    mcts_dirichlet_epsilon = 0.25,
-    temperature = 1.0,
-    exploration_moves = 30
-))]
-fn selfplay_tictactoe_ephemeral(
-    py: Python<'_>,
-    replay_buffer: &TicTacToeEphemeralReplayBuffer,
-    num_threads: usize,
-    workers_per_thread: usize,
-    target_samples: usize,
-    seed: u64,
-    execute_model: Py<PyAny>,
-    mcts_num_simulations: usize,
-    mcts_c_puct: f32,
-    mcts_dirichlet_alpha: f32,
-    mcts_dirichlet_epsilon: f32,
-    temperature: f32,
-    exploration_moves: usize,
-) -> PyResult<(usize, usize, Py<PyDict>)> {
-    use eval::PolicyValue;
-    use mcts::MCTSConfig;
-    use training::{run_training, TrainingConfig};
-    use worker::WorkerConfig;
+/// Macro to generate a persistent SelfPlay pyclass with a Python callback dispatch.
+macro_rules! typed_selfplay {
+    (
+        $name:ident,
+        $env:ty,
+        $obs_ty:ty,
+        $obs_dim:ty,
+        $obs_batched_dim:ty,
+        $replay_buf_class:ident,
+        $num_actions:expr,
+        callback_dispatch
+    ) => {
+        #[doc = concat!("Persistent self-play session for ", stringify!($name), ".")]
+        #[pyclass]
+        struct $name {
+            session: Option<training::SelfPlaySession>,
+        }
 
-    if mcts_num_simulations == 0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_num_simulations must be >= 1",
-        ));
-    }
-    if mcts_c_puct <= 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_c_puct must be > 0",
-        ));
-    }
-    if mcts_dirichlet_alpha <= 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_dirichlet_alpha must be > 0",
-        ));
-    }
-    if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_dirichlet_epsilon must be in [0, 1]",
-        ));
-    }
-    if temperature < 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "temperature must be >= 0",
-        ));
-    }
+        #[pymethods]
+        impl $name {
+            #[new]
+            #[rustfmt::skip]
+            #[pyo3(signature = (
+                replay_buffer,
+                num_threads,
+                workers_per_thread,
+                seed,
+                execute_model,
+                mcts_num_simulations = 20,
+                mcts_c_puct = 1.5,
+                mcts_dirichlet_alpha = 0.3,
+                mcts_dirichlet_epsilon = 0.25,
+                temperature = 1.0,
+                exploration_moves = 30,
+            ))]
+            fn new(
+                replay_buffer: &$replay_buf_class,
+                num_threads: usize,
+                workers_per_thread: usize,
+                seed: u64,
+                execute_model: Py<PyAny>,
+                mcts_num_simulations: usize,
+                mcts_c_puct: f32,
+                mcts_dirichlet_alpha: f32,
+                mcts_dirichlet_epsilon: f32,
+                temperature: f32,
+                exploration_moves: usize,
+            ) -> PyResult<Self> {
+                use eval::PolicyValue;
+                use mcts::MCTSConfig;
+                use training::{SelfPlaySession, SessionConfig};
+                use worker::WorkerConfig;
 
-    let config = TrainingConfig {
-        num_threads,
-        workers_per_thread,
-        seed,
-        target_samples,
-        worker: WorkerConfig {
-            mcts: MCTSConfig {
-                num_simulations: mcts_num_simulations,
-                c_puct: mcts_c_puct,
-                dirichlet_alpha: mcts_dirichlet_alpha,
-                dirichlet_epsilon: mcts_dirichlet_epsilon,
-                ..Default::default()
-            },
-            temperature,
-            exploration_moves,
-            ..Default::default()
-        },
-    };
+                if mcts_num_simulations == 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "mcts_num_simulations must be >= 1",
+                    ));
+                }
+                if mcts_c_puct <= 0.0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "mcts_c_puct must be > 0",
+                    ));
+                }
+                if mcts_dirichlet_alpha <= 0.0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "mcts_dirichlet_alpha must be > 0",
+                    ));
+                }
+                if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "mcts_dirichlet_epsilon must be in [0, 1]",
+                    ));
+                }
+                if temperature < 0.0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "temperature must be >= 0",
+                    ));
+                }
 
-    let dispatch = move |_batch_idx: usize,
-                         obs_view: ArrayView<i8, Ix2>,
-                         completion: queue::BatchCompletion<PolicyValue<9>>| {
-        let mut outputs = vec![PolicyValue::<9>::default(); queue::BATCH_SIZE];
-        Python::attach(|py| {
-            // Zero-copy numpy array from obs_view
-            // SAFETY: obs_view is valid for the duration of this callback,
-            // and the numpy array doesn't escape the callback scope.
-            let np_obs = unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
+                let config = SessionConfig {
+                    num_threads,
+                    workers_per_thread,
+                    seed,
+                    worker: WorkerConfig {
+                        mcts: MCTSConfig {
+                            num_simulations: mcts_num_simulations,
+                            c_puct: mcts_c_puct,
+                            dirichlet_alpha: mcts_dirichlet_alpha,
+                            dirichlet_epsilon: mcts_dirichlet_epsilon,
+                            ..Default::default()
+                        },
+                        temperature,
+                        exploration_moves,
+                        ..Default::default()
+                    },
+                };
 
-            // Call Python: (BATCH_SIZE, 9) -> ((BATCH_SIZE, 9), (BATCH_SIZE,))
-            let result = execute_model
-                .call1(py, (np_obs,))
-                .expect("execute_model call failed");
+                let dispatch = move |_batch_idx: usize,
+                                     obs_view: ArrayView<$obs_ty, $obs_batched_dim>,
+                                     completion: queue::BatchCompletion<
+                    PolicyValue<$num_actions>,
+                >| {
+                    let mut outputs =
+                        vec![PolicyValue::<$num_actions>::default(); queue::BATCH_SIZE];
+                    Python::attach(|py| {
+                        // SAFETY: obs_view is valid for the duration of this callback,
+                        // and the numpy array doesn't escape the callback scope.
+                        let np_obs = unsafe {
+                            PyArray::borrow_from_array(&obs_view, py.None().into_bound(py))
+                        };
 
-            let (policy_arr, value_arr): (
-                Bound<'_, PyArray<f32, Ix2>>,
-                Bound<'_, PyArray<f32, Ix1>>,
-            ) = result
-                .extract(py)
-                .expect("expected (policy, value) tuple of numpy arrays");
+                        let result = execute_model
+                            .call1(py, (np_obs,))
+                            .expect("execute_model call failed");
 
-            // Copy results back to PolicyValue outputs
-            let policy = unsafe { policy_arr.as_slice().unwrap() };
-            let value = unsafe { value_arr.as_slice().unwrap() };
+                        let (policy_arr, value_arr): (
+                            Bound<'_, PyArray<f32, Ix2>>,
+                            Bound<'_, PyArray<f32, Ix1>>,
+                        ) = result
+                            .extract(py)
+                            .expect("expected (policy, value) tuple of numpy arrays");
 
-            for (i, out) in outputs.iter_mut().enumerate() {
-                out.policy.copy_from_slice(&policy[i * 9..(i + 1) * 9]);
-                out.value = value[i];
+                        let policy = unsafe { policy_arr.as_slice().unwrap() };
+                        let value = unsafe { value_arr.as_slice().unwrap() };
+
+                        for (i, out) in outputs.iter_mut().enumerate() {
+                            out.policy
+                                .copy_from_slice(&policy[i * $num_actions..(i + 1) * $num_actions]);
+                            out.value = value[i];
+                        }
+                    });
+                    completion.complete(&outputs);
+                };
+
+                let session = SelfPlaySession::new::<$env, $num_actions, _>(
+                    config,
+                    replay_buffer.inner().clone(),
+                    dispatch,
+                );
+
+                Ok(Self {
+                    session: Some(session),
+                })
             }
-        });
-        completion.complete(&outputs);
-    };
 
-    // Release GIL while running training, reacquire in dispatch callback
-    let result =
-        py.detach(|| run_training::<TicTacToe, 9, _>(config, replay_buffer.inner(), dispatch));
-
-    let stats = PyDict::new(py);
-    stats.set_item("poll_rounds", result.executor.poll_rounds)?;
-    stats.set_item("futures_polled", result.executor.futures_polled)?;
-    stats.set_item("poll_ready", result.executor.poll_ready)?;
-    stats.set_item("poll_pending", result.executor.poll_pending)?;
-    stats.set_item("wait_count", result.executor.wait_count)?;
-
-    Ok((
-        result.games_completed,
-        result.samples_collected,
-        stats.into(),
-    ))
-}
-
-/// Run Connect4 self-play with Python model callback.
-///
-/// The callback receives observations as a (BATCH_SIZE, 6, 7) int8 numpy array.
-/// Board encoding: 0 = empty, 1 = PlayerA, -1 = PlayerB
-/// Row 0 is top, row 5 is bottom. Pieces fall down.
-///
-/// Returns (policy, value) tuple where:
-/// - policy: (BATCH_SIZE, 7) float32 - action probabilities for each column
-/// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
-#[pyfunction]
-#[pyo3(signature = (
-    replay_buffer,
-    num_threads,
-    workers_per_thread,
-    target_samples,
-    seed,
-    execute_model,
-    mcts_num_simulations = 20,
-    mcts_c_puct = 1.5,
-    mcts_dirichlet_alpha = 0.3,
-    mcts_dirichlet_epsilon = 0.25,
-    temperature = 1.0,
-    exploration_moves = 30
-))]
-fn selfplay_connect4_ephemeral(
-    py: Python<'_>,
-    replay_buffer: &Connect4EphemeralReplayBuffer,
-    num_threads: usize,
-    workers_per_thread: usize,
-    target_samples: usize,
-    seed: u64,
-    execute_model: Py<PyAny>,
-    mcts_num_simulations: usize,
-    mcts_c_puct: f32,
-    mcts_dirichlet_alpha: f32,
-    mcts_dirichlet_epsilon: f32,
-    temperature: f32,
-    exploration_moves: usize,
-) -> PyResult<(usize, usize, Py<PyDict>)> {
-    use eval::PolicyValue;
-    use mcts::MCTSConfig;
-    use training::{run_training, TrainingConfig};
-    use worker::WorkerConfig;
-
-    if mcts_num_simulations == 0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_num_simulations must be >= 1",
-        ));
-    }
-    if mcts_c_puct <= 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_c_puct must be > 0",
-        ));
-    }
-    if mcts_dirichlet_alpha <= 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_dirichlet_alpha must be > 0",
-        ));
-    }
-    if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_dirichlet_epsilon must be in [0, 1]",
-        ));
-    }
-    if temperature < 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "temperature must be >= 0",
-        ));
-    }
-
-    let config = TrainingConfig {
-        num_threads,
-        workers_per_thread,
-        seed,
-        target_samples,
-        worker: WorkerConfig {
-            mcts: MCTSConfig {
-                num_simulations: mcts_num_simulations,
-                c_puct: mcts_c_puct,
-                dirichlet_alpha: mcts_dirichlet_alpha,
-                dirichlet_epsilon: mcts_dirichlet_epsilon,
-                ..Default::default()
-            },
-            temperature,
-            exploration_moves,
-            ..Default::default()
-        },
-    };
-
-    let dispatch = move |_batch_idx: usize,
-                         obs_view: ArrayView<i8, Ix3>,
-                         completion: queue::BatchCompletion<PolicyValue<7>>| {
-        let mut outputs = vec![PolicyValue::<7>::default(); queue::BATCH_SIZE];
-        Python::attach(|py| {
-            // Zero-copy numpy array from obs_view
-            // SAFETY: obs_view is valid for the duration of this callback,
-            // and the numpy array doesn't escape the callback scope.
-            let np_obs = unsafe { PyArray::borrow_from_array(&obs_view, py.None().into_bound(py)) };
-
-            // Call Python: (BATCH_SIZE, 6, 7) -> ((BATCH_SIZE, 7), (BATCH_SIZE,))
-            let result = execute_model
-                .call1(py, (np_obs,))
-                .expect("execute_model call failed");
-
-            let (policy_arr, value_arr): (
-                Bound<'_, PyArray<f32, Ix2>>,
-                Bound<'_, PyArray<f32, Ix1>>,
-            ) = result
-                .extract(py)
-                .expect("expected (policy, value) tuple of numpy arrays");
-
-            // Copy results back to PolicyValue outputs
-            let policy = unsafe { policy_arr.as_slice().unwrap() };
-            let value = unsafe { value_arr.as_slice().unwrap() };
-
-            for (i, out) in outputs.iter_mut().enumerate() {
-                out.policy.copy_from_slice(&policy[i * 7..(i + 1) * 7]);
-                out.value = value[i];
+            /// Start self-play with no sample limit.
+            fn start(&self) -> PyResult<()> {
+                self.session
+                    .as_ref()
+                    .ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
+                    })?
+                    .start();
+                Ok(())
             }
-        });
-        completion.complete(&outputs);
-    };
 
-    // Release GIL while running training, reacquire in dispatch callback
-    let result =
-        py.detach(|| run_training::<Connect4, 7, _>(config, replay_buffer.inner(), dispatch));
-
-    let stats = PyDict::new(py);
-    stats.set_item("poll_rounds", result.executor.poll_rounds)?;
-    stats.set_item("futures_polled", result.executor.futures_polled)?;
-    stats.set_item("poll_ready", result.executor.poll_ready)?;
-    stats.set_item("poll_pending", result.executor.poll_pending)?;
-    stats.set_item("wait_count", result.executor.wait_count)?;
-
-    Ok((
-        result.games_completed,
-        result.samples_collected,
-        stats.into(),
-    ))
-}
-
-/// Run ByteFight self-play with Python model callback.
-///
-/// The callback receives observations as a (BATCH_SIZE, 18, 16) uint8 numpy array.
-/// Layout: first 16x16 bytes are bitpacked board cells, then 8 direction bytes,
-/// then 18 quantized heuristics bytes, then zero padding.
-///
-/// Returns (policy, value) tuple where:
-/// - policy: (BATCH_SIZE, 7) float32 - action probabilities
-///   Actions: 0=Forward, 1=Left, 2=LeftForward, 3=Right, 4=RightForward, 5=Trap, 6=EndTurn
-/// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
-#[pyfunction]
-#[pyo3(signature = (
-    replay_buffer,
-    num_threads,
-    workers_per_thread,
-    target_samples,
-    seed,
-    *,
-    mcts_num_simulations = 20,
-    mcts_c_puct = 1.5,
-    mcts_dirichlet_alpha = 0.3,
-    mcts_dirichlet_epsilon = 0.25,
-    temperature = 1.0,
-    exploration_moves = 30,
-    model,
-    selfplay_precision = "fp32"
-))]
-fn selfplay_bytefight_ephemeral(
-    py: Python<'_>,
-    replay_buffer: &ByteFightEphemeralReplayBuffer,
-    num_threads: usize,
-    workers_per_thread: usize,
-    target_samples: usize,
-    seed: u64,
-    mcts_num_simulations: usize,
-    mcts_c_puct: f32,
-    mcts_dirichlet_alpha: f32,
-    mcts_dirichlet_epsilon: f32,
-    temperature: f32,
-    exploration_moves: usize,
-    model: Py<PyAny>,
-    selfplay_precision: &str,
-) -> PyResult<(usize, usize, Py<PyDict>)> {
-    use cudagraph::ByteFightCudaGraphRunner;
-    use eval::PolicyValue;
-    use mcts::MCTSConfig;
-    use queue::{queue_shape_for_workers, BATCH_SIZE};
-    use training::{run_training, TrainingConfig};
-    use worker::WorkerConfig;
-
-    if mcts_num_simulations == 0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_num_simulations must be >= 1",
-        ));
-    }
-    if mcts_c_puct <= 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_c_puct must be > 0",
-        ));
-    }
-    if mcts_dirichlet_alpha <= 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_dirichlet_alpha must be > 0",
-        ));
-    }
-    if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "mcts_dirichlet_epsilon must be in [0, 1]",
-        ));
-    }
-    if temperature < 0.0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "temperature must be >= 0",
-        ));
-    }
-
-    let config = TrainingConfig {
-        num_threads,
-        workers_per_thread,
-        seed,
-        target_samples,
-        worker: WorkerConfig {
-            mcts: MCTSConfig {
-                num_simulations: mcts_num_simulations,
-                c_puct: mcts_c_puct,
-                dirichlet_alpha: mcts_dirichlet_alpha,
-                dirichlet_epsilon: mcts_dirichlet_epsilon,
-                ..Default::default()
-            },
-            temperature,
-            exploration_moves,
-            ..Default::default()
-        },
-    };
-
-    let batches_dispatched = Arc::new(AtomicUsize::new(0));
-
-    let total_workers = num_threads.checked_mul(workers_per_thread).ok_or_else(|| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>("num_threads * workers_per_thread overflow")
-    })?;
-    let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
-    let model_ptr = model.bind(py).as_ptr() as usize;
-    let runner = {
-        let cache = bytefight_graph_cache();
-        let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
-
-        let needs_rebuild = match guard.as_ref() {
-            Some(entry) => {
-                entry.model_ptr != model_ptr
-                    || entry.num_batches != num_batches
-                    || entry.precision != selfplay_precision
+            /// Block until absolute target_samples is reached, then pause and quiesce.
+            fn wait_for(&self, py: Python<'_>, target_samples: usize) -> PyResult<usize> {
+                let session = self.session.as_ref().ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
+                })?;
+                let result = py.detach(|| session.wait_for(target_samples));
+                Ok(result)
             }
-            None => true,
-        };
 
-        if needs_rebuild {
-            let runner = Arc::new(ByteFightCudaGraphRunner::new(
-                py,
-                model.clone_ref(py),
-                num_batches,
-                BATCH_SIZE,
-                selfplay_precision,
-            )?);
-            *guard = Some(ByteFightGraphCacheEntry {
-                model_ptr,
-                num_batches,
-                precision: selfplay_precision.to_string(),
-                runner: runner.clone(),
-            });
-            runner
-        } else {
-            guard
-                .as_ref()
-                .expect("cached runner should exist")
-                .runner
-                .clone()
+            /// Return the current absolute sample count.
+            fn samples(&self) -> PyResult<usize> {
+                Ok(self
+                    .session
+                    .as_ref()
+                    .ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
+                    })?
+                    .samples())
+            }
+
+            /// Shut down the session. Idempotent.
+            #[pyo3(name = "drop")]
+            fn py_drop(&mut self) {
+                if let Some(mut session) = self.session.take() {
+                    session.shutdown();
+                }
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                if let Some(mut session) = self.session.take() {
+                    session.shutdown();
+                }
+            }
         }
     };
+}
 
-    let batches_dispatched_ref = batches_dispatched.clone();
-    let dispatch = move |batch_idx: usize,
-                         obs_view: ArrayView<u8, Ix3>,
-                         completion: queue::BatchCompletion<PolicyValue<7>>| {
-        batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
-        runner.dispatch_async(batch_idx, obs_view, completion);
-    };
+// TicTacToe self-play: callback-based dispatch
+typed_selfplay!(
+    TicTacToeSelfPlay,
+    TicTacToe,
+    i8,
+    Ix1,
+    Ix2,
+    TicTacToeEphemeralReplayBuffer,
+    9,
+    callback_dispatch
+);
 
-    let result =
-        py.detach(|| run_training::<ByteFight, 7, _>(config, replay_buffer.inner(), dispatch));
+// Connect4 self-play: callback-based dispatch
+typed_selfplay!(
+    Connect4SelfPlay,
+    Connect4,
+    i8,
+    Ix2,
+    Ix3,
+    Connect4EphemeralReplayBuffer,
+    7,
+    callback_dispatch
+);
 
-    let stats = PyDict::new(py);
-    stats.set_item("poll_rounds", result.executor.poll_rounds)?;
-    stats.set_item("futures_polled", result.executor.futures_polled)?;
-    stats.set_item("poll_ready", result.executor.poll_ready)?;
-    stats.set_item("poll_pending", result.executor.poll_pending)?;
-    stats.set_item("wait_count", result.executor.wait_count)?;
-    stats.set_item(
-        "batches_dispatched",
-        batches_dispatched.load(Ordering::Relaxed),
-    )?;
+/// Persistent ByteFight self-play session.
+///
+/// Uses the CUDA graph runner for GPU dispatch (no Python callback).
+#[pyclass]
+struct ByteFightSelfPlay {
+    session: Option<training::SelfPlaySession>,
+}
 
-    Ok((
-        result.games_completed,
-        result.samples_collected,
-        stats.into(),
-    ))
+#[pymethods]
+impl ByteFightSelfPlay {
+    #[new]
+    #[pyo3(signature = (
+        replay_buffer,
+        num_threads,
+        workers_per_thread,
+        seed,
+        *,
+        mcts_num_simulations = 20,
+        mcts_c_puct = 1.5,
+        mcts_dirichlet_alpha = 0.3,
+        mcts_dirichlet_epsilon = 0.25,
+        temperature = 1.0,
+        exploration_moves = 30,
+        model,
+        selfplay_precision = "fp32"
+    ))]
+    fn new(
+        py: Python<'_>,
+        replay_buffer: &ByteFightEphemeralReplayBuffer,
+        num_threads: usize,
+        workers_per_thread: usize,
+        seed: u64,
+        mcts_num_simulations: usize,
+        mcts_c_puct: f32,
+        mcts_dirichlet_alpha: f32,
+        mcts_dirichlet_epsilon: f32,
+        temperature: f32,
+        exploration_moves: usize,
+        model: Py<PyAny>,
+        selfplay_precision: &str,
+    ) -> PyResult<Self> {
+        use cudagraph::ByteFightCudaGraphRunner;
+        use eval::PolicyValue;
+        use mcts::MCTSConfig;
+        use queue::{queue_shape_for_workers, BATCH_SIZE};
+        use training::{SelfPlaySession, SessionConfig};
+        use worker::WorkerConfig;
+
+        if mcts_num_simulations == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "mcts_num_simulations must be >= 1",
+            ));
+        }
+        if mcts_c_puct <= 0.0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "mcts_c_puct must be > 0",
+            ));
+        }
+        if mcts_dirichlet_alpha <= 0.0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "mcts_dirichlet_alpha must be > 0",
+            ));
+        }
+        if !(0.0..=1.0).contains(&mcts_dirichlet_epsilon) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "mcts_dirichlet_epsilon must be in [0, 1]",
+            ));
+        }
+        if temperature < 0.0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "temperature must be >= 0",
+            ));
+        }
+
+        let config = SessionConfig {
+            num_threads,
+            workers_per_thread,
+            seed,
+            worker: WorkerConfig {
+                mcts: MCTSConfig {
+                    num_simulations: mcts_num_simulations,
+                    c_puct: mcts_c_puct,
+                    dirichlet_alpha: mcts_dirichlet_alpha,
+                    dirichlet_epsilon: mcts_dirichlet_epsilon,
+                    ..Default::default()
+                },
+                temperature,
+                exploration_moves,
+                ..Default::default()
+            },
+        };
+
+        let total_workers = num_threads.checked_mul(workers_per_thread).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "num_threads * workers_per_thread overflow",
+            )
+        })?;
+        let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
+        let model_ptr = model.bind(py).as_ptr() as usize;
+
+        // Build or reuse the CUDA graph runner.
+        let runner = {
+            let cache = bytefight_graph_cache();
+            let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
+
+            let needs_rebuild = match guard.as_ref() {
+                Some(entry) => {
+                    entry.model_ptr != model_ptr
+                        || entry.num_batches != num_batches
+                        || entry.precision != selfplay_precision
+                }
+                None => true,
+            };
+
+            if needs_rebuild {
+                let runner = Arc::new(ByteFightCudaGraphRunner::new(
+                    py,
+                    model.clone_ref(py),
+                    num_batches,
+                    BATCH_SIZE,
+                    selfplay_precision,
+                )?);
+                *guard = Some(ByteFightGraphCacheEntry {
+                    model_ptr,
+                    num_batches,
+                    precision: selfplay_precision.to_string(),
+                    runner: runner.clone(),
+                });
+                runner
+            } else {
+                guard
+                    .as_ref()
+                    .expect("cached runner should exist")
+                    .runner
+                    .clone()
+            }
+        };
+
+        let dispatch =
+            move |batch_idx: usize,
+                  obs_view: ArrayView<u8, Ix3>,
+                  completion: queue::BatchCompletion<PolicyValue<7>>| {
+                runner.dispatch_async(batch_idx, obs_view, completion);
+            };
+
+        let session = SelfPlaySession::new::<ByteFight, 7, _>(
+            config,
+            replay_buffer.inner().clone(),
+            dispatch,
+        );
+
+        Ok(Self {
+            session: Some(session),
+        })
+    }
+
+    /// Start self-play with no sample limit.
+    fn start(&self) -> PyResult<()> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
+            })?
+            .start();
+        Ok(())
+    }
+
+    /// Block until absolute target_samples is reached, then pause and quiesce.
+    fn wait_for(&self, py: Python<'_>, target_samples: usize) -> PyResult<usize> {
+        let session = self.session.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
+        })?;
+        let result = py.detach(|| session.wait_for(target_samples));
+        Ok(result)
+    }
+
+    /// Return the current absolute sample count.
+    fn samples(&self) -> PyResult<usize> {
+        Ok(self
+            .session
+            .as_ref()
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
+            })?
+            .samples())
+    }
+
+    /// Shut down the session. Idempotent.
+    #[pyo3(name = "drop")]
+    fn py_drop(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            session.shutdown();
+        }
+    }
+}
+
+impl Drop for ByteFightSelfPlay {
+    fn drop(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            session.shutdown();
+        }
+    }
 }
 
 #[pymodule]
@@ -674,9 +646,9 @@ fn siebren(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TicTacToeEphemeralReplayBuffer>()?;
     m.add_class::<Connect4EphemeralReplayBuffer>()?;
     m.add_class::<ByteFightEphemeralReplayBuffer>()?;
-    m.add_function(wrap_pyfunction!(selfplay_tictactoe_ephemeral, m)?)?;
-    m.add_function(wrap_pyfunction!(selfplay_connect4_ephemeral, m)?)?;
-    m.add_function(wrap_pyfunction!(selfplay_bytefight_ephemeral, m)?)?;
+    m.add_class::<TicTacToeSelfPlay>()?;
+    m.add_class::<Connect4SelfPlay>()?;
+    m.add_class::<ByteFightSelfPlay>()?;
     Ok(())
 }
 

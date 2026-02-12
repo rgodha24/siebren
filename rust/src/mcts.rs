@@ -331,7 +331,7 @@ mod tests {
         // Use a dummy event for the executor
         let event = event_listener::Event::new();
         let executor = Executor::new(|| event.listen());
-        executor.run(vec![Box::pin(fut)], || false);
+        executor.run(&mut vec![Box::pin(fut)], &mut || false);
 
         let visits = result.borrow().clone().unwrap();
         assert_eq!(visits.len(), 9);

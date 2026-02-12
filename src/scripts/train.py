@@ -61,7 +61,6 @@ class TrainConfig:
     compile_fullgraph: bool = False
     cudagraphs: bool = False
     selfplay_backend: str = "rust-cudagraph"
-    inference_cuda_graph: bool = True
     selfplay_precision: str = "fp16"
     matmul_precision: str = "high"
 
@@ -612,23 +611,6 @@ def train(config: TrainConfig):
     else:
         raise ValueError(f"Unknown game: {config.game}")
 
-    selfplay = SelfPlay(
-        game=config.game,
-        num_threads=config.num_threads,
-        workers_per_thread=config.workers_per_thread,
-        mcts_num_simulations=config.mcts_num_simulations,
-        mcts_c_puct=config.mcts_c_puct,
-        mcts_dirichlet_alpha=config.mcts_dirichlet_alpha,
-        mcts_dirichlet_epsilon=config.mcts_dirichlet_epsilon,
-        temperature=config.selfplay_temperature,
-        exploration_moves=config.selfplay_exploration_moves,
-        seed=config.seed,
-    )
-    replay_buffer = EphemeralReplayBuffer(
-        config.replay_buffer_capacity,
-        game=config.game,
-    )
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
 
     # Setup checkpoint directory
@@ -645,8 +627,8 @@ def train(config: TrainConfig):
             model,
             optimizer,
             str(checkpoint_path),
-            replay_buffer,
-            str(buffer_path) if buffer_path.exists() else None,
+            None,
+            None,
         )
         start_epoch += 1  # Start from the next epoch
         print(f"Resumed from epoch {start_epoch - 1}, starting at epoch {start_epoch}")
@@ -661,121 +643,89 @@ def train(config: TrainConfig):
         )
         config.cudagraphs = False
 
-    use_rust_cudagraph = config.game == "bytefight"
-    if config.selfplay_backend == "rust-cudagraph" and config.game != "bytefight":
-        print(
-            "Warning: rust-cudagraph backend currently supports only bytefight; "
-            "falling back to python callback backend."
-        )
-    if config.game == "bytefight" and config.selfplay_backend != "rust-cudagraph":
-        print(
-            "Warning: bytefight now requires rust-cudagraph backend; "
-            "overriding --selfplay-backend to rust-cudagraph."
-        )
-
     model = maybe_compile_model(model, config)
 
-    execute_model: Optional[Callable[[np.ndarray], Tuple[np.ndarray, np.ndarray]]] = (
-        None
+    # Build persistent self-play session (threads created but paused).
+    replay_buffer = EphemeralReplayBuffer(
+        config.replay_buffer_capacity,
+        game=config.game,
     )
-    if not use_rust_cudagraph:
+    if config.game == "bytefight":
+        # ByteFight uses the Rust CUDA graph runner for dispatch.
+        selfplay = SelfPlay(
+            game=config.game,
+            replay_buffer=replay_buffer,
+            num_threads=config.num_threads,
+            workers_per_thread=config.workers_per_thread,
+            mcts_num_simulations=config.mcts_num_simulations,
+            mcts_c_puct=config.mcts_c_puct,
+            mcts_dirichlet_alpha=config.mcts_dirichlet_alpha,
+            mcts_dirichlet_epsilon=config.mcts_dirichlet_epsilon,
+            temperature=config.selfplay_temperature,
+            exploration_moves=config.selfplay_exploration_moves,
+            seed=config.seed,
+            model=model,
+            selfplay_precision=config.selfplay_precision,
+        )
+    else:
+        # Other games use a Python callback for inference.
         execute_model = make_execute_model(
             model,
             config.device,
             num_actions,
-            config.inference_cuda_graph,
-            config.selfplay_precision,
+            use_inference_cuda_graph=config.device.startswith("cuda"),
+            selfplay_precision=config.selfplay_precision,
+        )
+        selfplay = SelfPlay(
+            game=config.game,
+            replay_buffer=replay_buffer,
+            num_threads=config.num_threads,
+            workers_per_thread=config.workers_per_thread,
+            mcts_num_simulations=config.mcts_num_simulations,
+            mcts_c_puct=config.mcts_c_puct,
+            mcts_dirichlet_alpha=config.mcts_dirichlet_alpha,
+            mcts_dirichlet_epsilon=config.mcts_dirichlet_epsilon,
+            temperature=config.selfplay_temperature,
+            exploration_moves=config.selfplay_exploration_moves,
+            seed=config.seed,
+            execute_model=execute_model,
         )
 
     # Track metrics
-    total_games = 0
-    total_batches = 0
     global_step = start_epoch
-
-    # Batch counter - reused across epochs to avoid creating new closures
-    batch_count = [0]
-    execute_model_time_sec = [0.0]
-
-    def counting_execute_model(obs):
-        assert execute_model is not None
-        batch_count[0] += 1
-        start = time.perf_counter()
-        out = execute_model(obs)
-        execute_model_time_sec[0] += time.perf_counter() - start
-        return out
 
     for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
 
-        # Self-play phase
+        # Self-play phase: use absolute sample targets
         model.eval()
-        batch_count[0] = 0  # Reset counter for this epoch
-        execute_model_time_sec[0] = 0.0
-
+        before = selfplay.samples()
         selfplay_start = time.time()
-        if use_rust_cudagraph:
-            selfplay_result = selfplay.play_games(
-                replay_buffer=replay_buffer,
-                num_samples=config.samples_per_epoch,
-                model=model,
-                selfplay_precision=config.selfplay_precision,
-            )
-        else:
-            selfplay_result = selfplay.play_games(
-                replay_buffer=replay_buffer,
-                num_samples=config.samples_per_epoch,
-                execute_model=counting_execute_model,
-            )
-        games_completed, samples_collected, executor_stats = selfplay_result
+        reached = selfplay.wait_for(before + config.samples_per_epoch)
         selfplay_time = time.time() - selfplay_start
-        dispatch_batches = int(executor_stats.get("batches_dispatched", batch_count[0]))
-
-        total_games += games_completed
-        total_batches += dispatch_batches
-
-        moves_per_game = (
-            samples_collected / games_completed if games_completed > 0 else 0.0
-        )
+        samples_collected = reached - before
 
         # Log self-play metrics
         selfplay_metrics = {
             "epoch": epoch,
-            "selfplay/games_completed": games_completed,
             "selfplay/samples_collected": samples_collected,
+            "selfplay/samples_total": reached,
             "selfplay/mcts_num_simulations": config.mcts_num_simulations,
             "selfplay/mcts_c_puct": config.mcts_c_puct,
             "selfplay/mcts_dirichlet_alpha": config.mcts_dirichlet_alpha,
             "selfplay/mcts_dirichlet_epsilon": config.mcts_dirichlet_epsilon,
             "selfplay/temperature": config.selfplay_temperature,
             "selfplay/exploration_moves": config.selfplay_exploration_moves,
-            "selfplay/moves_per_game": moves_per_game,
-            "selfplay/batches": dispatch_batches,
             "selfplay/time_sec": selfplay_time,
-            "selfplay/games_per_sec": games_completed / selfplay_time,
-            "selfplay/samples_per_sec": samples_collected / selfplay_time,
-            "selfplay/batches_per_sec": dispatch_batches / selfplay_time,
-            "selfplay/execute_model_time_sec": execute_model_time_sec[0],
-            "selfplay/execute_model_time_per_batch_ms": (
-                1000.0 * execute_model_time_sec[0] / dispatch_batches
-                if dispatch_batches > 0
-                else 0.0
-            ),
-            "selfplay/execute_model_fraction": (
-                execute_model_time_sec[0] / selfplay_time if selfplay_time > 0 else 0.0
+            "selfplay/samples_per_sec": (
+                samples_collected / selfplay_time if selfplay_time > 0 else 0.0
             ),
             "selfplay/backend": config.selfplay_backend,
-            "selfplay/executor_poll_rounds": executor_stats["poll_rounds"],
-            "selfplay/executor_futures_polled": executor_stats["futures_polled"],
-            "selfplay/executor_poll_ready": executor_stats["poll_ready"],
-            "selfplay/executor_poll_pending": executor_stats["poll_pending"],
-            "selfplay/executor_wait_count": executor_stats["wait_count"],
-            "total/games": total_games,
-            "total/batches": total_batches,
             "replay_buffer/size": len(replay_buffer),
         }
         wandb.log(selfplay_metrics, step=global_step)
 
-        # Training phase
+        # Training phase (selfplay is paused/quiesced, safe to read buffer)
         if len(replay_buffer) >= config.train_batch_size:
             model.train()
             train_start = time.time()
@@ -844,8 +794,7 @@ def train(config: TrainConfig):
         # Print progress
         buffer_pct = 100 * len(replay_buffer) / config.replay_buffer_capacity
         print(
-            f"Epoch {epoch}: {games_completed} games, {samples_collected} samples, "
-            f"{moves_per_game:.1f} moves/game, "
+            f"Epoch {epoch}: {samples_collected} samples, "
             f"buffer {len(replay_buffer)}/{config.replay_buffer_capacity} ({buffer_pct:.1f}%), "
             f"{epoch_time:.1f}s"
         )
@@ -855,6 +804,8 @@ def train(config: TrainConfig):
             save_checkpoint(
                 model, optimizer, epoch, config, replay_buffer, checkpoint_dir
             )
+
+    selfplay.drop()
 
     wandb.finish()
 
@@ -1020,12 +971,6 @@ def main():
         help="Self-play inference backend",
     )
     parser.add_argument(
-        "--inference-cuda-graph",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use explicit CUDA graph replay in self-play execute_model callback",
-    )
-    parser.add_argument(
         "--selfplay-precision",
         type=str,
         default="fp16",
@@ -1072,7 +1017,6 @@ def main():
         compile_fullgraph=args.compile_fullgraph,
         cudagraphs=args.cudagraphs,
         selfplay_backend=args.selfplay_backend,
-        inference_cuda_graph=args.inference_cuda_graph,
         selfplay_precision=args.selfplay_precision,
         matmul_precision=args.matmul_precision,
     )

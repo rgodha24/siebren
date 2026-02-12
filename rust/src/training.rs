@@ -1,10 +1,10 @@
 //! Training infrastructure - thread spawning and coordination.
 //!
-//! This module provides the entry point for running parallel self-play
-//! with GPU-batched inference.
+//! Provides `SelfPlaySession`: a persistent session with pause/resume semantics
+//! that preserves in-progress game state across boundaries.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use ndarray::ArrayView;
@@ -12,17 +12,69 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::eval::{GpuEvaluator, PolicyValue};
-use crate::executor::{
-    reset_executor_counters, take_executor_counters, Executor, ExecutorCounters,
-};
+use crate::executor::Executor;
 use crate::observation_replay_buffer::ObservationReplayBuffer;
 use crate::queue::{BatchCompletion, GpuJobQueue};
-use crate::worker::{worker_loop, WorkerConfig};
+use crate::worker::{worker_loop_forever, WorkerConfig};
 use crate::{BatchDim, Environment};
 
-/// Configuration for the training run.
+/// Shared control state for the persistent self-play session.
+///
+/// Counters are behind `Arc<AtomicUsize>` so they can be cloned directly
+/// into worker futures that expect `Arc<AtomicUsize>`.
+struct SessionControl {
+    /// Whether workers should be actively polling.
+    running: AtomicBool,
+    /// Whether the session is being torn down.
+    shutdown: AtomicBool,
+    /// Absolute target: workers pause when `samples_collected >= target`.
+    target_samples: AtomicUsize,
+    /// Total samples collected (monotonic across the session lifetime).
+    samples_collected: Arc<AtomicUsize>,
+    /// Total games completed.
+    games_completed: Arc<AtomicUsize>,
+    /// Number of threads currently inside the executor polling loop.
+    active_pollers: AtomicUsize,
+    /// Condvar + mutex for coordinating start/pause/quiesce/shutdown.
+    condvar: Condvar,
+    condvar_mutex: Mutex<()>,
+}
+
+impl SessionControl {
+    fn new() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            target_samples: AtomicUsize::new(0),
+            samples_collected: Arc::new(AtomicUsize::new(0)),
+            games_completed: Arc::new(AtomicUsize::new(0)),
+            active_pollers: AtomicUsize::new(0),
+            condvar: Condvar::new(),
+            condvar_mutex: Mutex::new(()),
+        }
+    }
+
+    /// Wake all threads blocked on the condvar.
+    fn wake_all(&self) {
+        self.condvar.notify_all();
+    }
+
+    /// Check if the thread should stop polling (pause or shutdown).
+    fn should_pause(&self) -> bool {
+        if self.shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        if !self.running.load(Ordering::Acquire) {
+            return true;
+        }
+        self.samples_collected.load(Ordering::Acquire)
+            >= self.target_samples.load(Ordering::Acquire)
+    }
+}
+
+/// Configuration for creating a persistent self-play session.
 #[derive(Clone)]
-pub struct TrainingConfig {
+pub struct SessionConfig {
     /// Number of OS threads to spawn.
     pub num_threads: usize,
     /// Number of workers per thread.
@@ -31,156 +83,228 @@ pub struct TrainingConfig {
     pub worker: WorkerConfig,
     /// Random seed for reproducibility.
     pub seed: u64,
-    /// Target number of samples to collect across all workers.
-    pub target_samples: usize,
 }
 
-impl Default for TrainingConfig {
+impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             num_threads: 32,
             workers_per_thread: 16,
             worker: WorkerConfig::default(),
             seed: 42,
-            target_samples: 102400,
         }
     }
 }
 
-/// Result of a training run.
-pub struct TrainingResult {
-    /// Total number of games completed.
-    pub games_completed: usize,
-    /// Total number of samples collected.
-    pub samples_collected: usize,
-    /// Aggregated executor counters across worker threads.
-    pub executor: ExecutorCounters,
+/// Trait-object wrapper so we can call `notify_all()` on the queue without
+/// leaking the full generic type into `SelfPlaySession`.
+trait QueueNotify: Send + Sync {
+    fn notify_all(&self);
 }
 
-#[derive(Default)]
-struct ExecutorCountersAtomic {
-    poll_rounds: AtomicU64,
-    futures_polled: AtomicU64,
-    poll_ready: AtomicU64,
-    poll_pending: AtomicU64,
-    wait_count: AtomicU64,
-}
-
-impl ExecutorCountersAtomic {
-    fn add(&self, counters: ExecutorCounters) {
-        self.poll_rounds
-            .fetch_add(counters.poll_rounds, Ordering::Relaxed);
-        self.futures_polled
-            .fetch_add(counters.futures_polled, Ordering::Relaxed);
-        self.poll_ready
-            .fetch_add(counters.poll_ready, Ordering::Relaxed);
-        self.poll_pending
-            .fetch_add(counters.poll_pending, Ordering::Relaxed);
-        self.wait_count
-            .fetch_add(counters.wait_count, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> ExecutorCounters {
-        ExecutorCounters {
-            poll_rounds: self.poll_rounds.load(Ordering::Relaxed),
-            futures_polled: self.futures_polled.load(Ordering::Relaxed),
-            poll_ready: self.poll_ready.load(Ordering::Relaxed),
-            poll_pending: self.poll_pending.load(Ordering::Relaxed),
-            wait_count: self.wait_count.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Run self-play training with the given configuration.
-///
-/// This spawns `num_threads` OS threads, each running `workers_per_thread`
-/// async workers. All workers share a single GPU job queue for batched inference.
-///
-/// The `dispatch` callback is called when a batch of observations is ready
-/// for GPU inference. It receives the queue batch slot index, a zero-copy view
-/// of the batched observations, and a completion handle that must be completed
-/// with policy/value outputs.
-///
-/// Workers share an atomic counter for samples collected. When the target is
-/// reached, remaining workers are cancelled via the executor. This allows
-/// fast workers to complete more games while slow workers are still playing.
-///
-/// Samples are pushed directly to the shared `replay_buffer` after each game.
-pub fn run_training<E, const NUM_ACTIONS: usize, F>(
-    config: TrainingConfig,
-    replay_buffer: &ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>,
-    dispatch: F,
-) -> TrainingResult
+impl<A, D, O> QueueNotify for GpuJobQueue<A, D, O>
 where
-    E: Environment + Clone + Send + 'static,
-    E::ObsDim: BatchDim,
-    F: Fn(
-            usize,
-            ArrayView<E::ObsElem, <E::ObsDim as BatchDim>::BatchedDim>,
-            BatchCompletion<PolicyValue<NUM_ACTIONS>>,
-        ) + Send
-        + Sync
-        + 'static,
+    A: Clone + Default + Send + Sync,
+    D: BatchDim,
+    O: Copy + Default + Send + Sync,
 {
-    let target_samples = config.target_samples;
+    fn notify_all(&self) {
+        GpuJobQueue::notify_all(self);
+    }
+}
 
-    // Shared counters for samples collected and games completed across all workers
-    let samples_collected = Arc::new(AtomicUsize::new(0));
-    let games_completed = Arc::new(AtomicUsize::new(0));
-    let executor_counters = Arc::new(ExecutorCountersAtomic::default());
+/// A persistent self-play session that owns worker threads and preserves
+/// in-progress game state across pause/resume boundaries.
+///
+/// # Lifecycle
+///
+/// 1. `new(...)` — creates threads and futures (paused).
+/// 2. `start()` — sets target to `usize::MAX` and wakes threads.
+/// 3. `wait_for(target)` — ensures running, blocks until `samples >= target`,
+///    then pauses and waits for all pollers to quiesce. Safe to read replay
+///    buffer after this returns.
+/// 4. `samples()` — returns current absolute sample count.
+/// 5. `shutdown()` / Rust `Drop` — sets shutdown, joins threads.
+pub struct SelfPlaySession {
+    control: Arc<SessionControl>,
+    /// Queue used by all workers. Kept alive for `notify_all` on drop.
+    queue_notify: Arc<dyn QueueNotify>,
+    /// Join handles for worker threads. `None` after `shutdown`.
+    threads: Option<Vec<thread::JoinHandle<()>>>,
+}
 
-    // Create shared GPU queue with observation shape
-    let total_workers = config
-        .num_threads
-        .checked_mul(config.workers_per_thread)
-        .expect("num_threads * workers_per_thread overflowed usize");
+impl SelfPlaySession {
+    /// Create a new persistent session.
+    ///
+    /// Threads are spawned immediately but start paused. The `dispatch` callback
+    /// is invoked when a batch of observations is ready for GPU inference.
+    pub fn new<E, const NUM_ACTIONS: usize, F>(
+        config: SessionConfig,
+        replay_buffer: Arc<ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>>,
+        dispatch: F,
+    ) -> Self
+    where
+        E: Environment + Clone + Send + 'static,
+        E::ObsDim: BatchDim,
+        F: Fn(
+                usize,
+                ArrayView<E::ObsElem, <E::ObsDim as BatchDim>::BatchedDim>,
+                BatchCompletion<PolicyValue<NUM_ACTIONS>>,
+            ) + Send
+            + Sync
+            + 'static,
+    {
+        let total_workers = config
+            .num_threads
+            .checked_mul(config.workers_per_thread)
+            .expect("num_threads * workers_per_thread overflowed usize");
 
-    let queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>> =
-        Arc::new(GpuJobQueue::new(E::OBS_SHAPE, total_workers, dispatch));
+        let queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>> =
+            Arc::new(GpuJobQueue::new(E::OBS_SHAPE, total_workers, dispatch));
 
-    // Use scoped threads to allow borrowing replay_buffer across threads
-    thread::scope(|s| {
+        let control = Arc::new(SessionControl::new());
+
+        let mut threads = Vec::with_capacity(config.num_threads);
         for thread_id in 0..config.num_threads {
             let queue = queue.clone();
+            let control = control.clone();
             let config = config.clone();
-            let samples_collected = samples_collected.clone();
-            let games_completed = games_completed.clone();
-            let executor_counters = executor_counters.clone();
+            let replay_buffer = replay_buffer.clone();
 
-            s.spawn(move || {
-                run_thread::<E, NUM_ACTIONS>(
+            let handle = thread::spawn(move || {
+                session_thread_main::<E, NUM_ACTIONS>(
                     thread_id,
                     queue,
                     config,
-                    samples_collected,
-                    games_completed,
-                    target_samples,
-                    executor_counters,
-                    replay_buffer,
-                )
+                    control,
+                    &replay_buffer,
+                );
             });
+            threads.push(handle);
         }
-    });
 
-    let final_samples = samples_collected.load(Ordering::Acquire);
-    let final_games = games_completed.load(Ordering::Acquire);
-    let executor = executor_counters.snapshot();
-    TrainingResult {
-        games_completed: final_games,
-        samples_collected: final_samples,
-        executor,
+        Self {
+            control,
+            queue_notify: queue,
+            threads: Some(threads),
+        }
+    }
+
+    /// Start self-play with no sample limit (runs until explicitly paused or
+    /// `wait_for` is called).
+    pub fn start(&self) {
+        self.control
+            .target_samples
+            .store(usize::MAX, Ordering::Release);
+        self.control.running.store(true, Ordering::Release);
+        self.control.wake_all();
+        self.queue_notify.notify_all();
+    }
+
+    /// Block until at least `target_samples` absolute samples have been
+    /// collected, then pause and quiesce all workers.
+    ///
+    /// Returns the actual number of samples collected (may exceed target).
+    ///
+    /// After this returns, no worker thread is inside the executor polling
+    /// loop, so it is safe to read the replay buffer.
+    pub fn wait_for(&self, target_samples: usize) -> usize {
+        // Set target and ensure running.
+        self.control
+            .target_samples
+            .store(target_samples, Ordering::Release);
+        self.control.running.store(true, Ordering::Release);
+        self.control.wake_all();
+        self.queue_notify.notify_all();
+
+        // Wait until target is reached (condvar-based, no spinning).
+        {
+            let mut guard = self
+                .control
+                .condvar_mutex
+                .lock()
+                .expect("condvar mutex poisoned");
+            while self.control.samples_collected.load(Ordering::Acquire) < target_samples
+                && !self.control.shutdown.load(Ordering::Acquire)
+            {
+                guard = self
+                    .control
+                    .condvar
+                    .wait(guard)
+                    .expect("condvar wait failed");
+            }
+        }
+
+        // Pause workers.
+        self.control.running.store(false, Ordering::Release);
+        self.queue_notify.notify_all();
+        self.control.wake_all();
+
+        // Wait for all pollers to exit (quiesce).
+        {
+            let mut guard = self
+                .control
+                .condvar_mutex
+                .lock()
+                .expect("condvar mutex poisoned");
+            while self.control.active_pollers.load(Ordering::Acquire) > 0
+                && !self.control.shutdown.load(Ordering::Acquire)
+            {
+                guard = self
+                    .control
+                    .condvar
+                    .wait(guard)
+                    .expect("condvar wait failed");
+            }
+        }
+
+        self.control.samples_collected.load(Ordering::Acquire)
+    }
+
+    /// Return the current absolute sample count.
+    pub fn samples(&self) -> usize {
+        self.control.samples_collected.load(Ordering::Acquire)
+    }
+
+    /// Return the current absolute game count.
+    pub fn games(&self) -> usize {
+        self.control.games_completed.load(Ordering::Acquire)
+    }
+
+    /// Shut down the session. Idempotent.
+    pub fn shutdown(&mut self) {
+        if let Some(threads) = self.threads.take() {
+            self.control.shutdown.store(true, Ordering::Release);
+            self.control.running.store(false, Ordering::Release);
+            self.control.wake_all();
+            self.queue_notify.notify_all();
+
+            for handle in threads {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
-/// Run a single worker thread with multiple async workers.
-fn run_thread<E, const NUM_ACTIONS: usize>(
+impl Drop for SelfPlaySession {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Main loop for a single thread in a persistent session.
+///
+/// 1. Wait on condvar until `running || shutdown`.
+/// 2. If shutdown => exit.
+/// 3. Increment `active_pollers`, run executor until pause/shutdown/target.
+/// 4. Decrement `active_pollers`, notify condvar so `wait_for()` can observe
+///    quiesce.
+/// 5. Goto 1.
+fn session_thread_main<E, const NUM_ACTIONS: usize>(
     thread_id: usize,
     queue: Arc<GpuJobQueue<E::ObsElem, E::ObsDim, PolicyValue<NUM_ACTIONS>>>,
-    config: TrainingConfig,
-    samples_collected: Arc<AtomicUsize>,
-    games_completed: Arc<AtomicUsize>,
-    target_samples: usize,
-    executor_counters: Arc<ExecutorCountersAtomic>,
+    config: SessionConfig,
+    control: Arc<SessionControl>,
     replay_buffer: &ObservationReplayBuffer<E::ObsElem, E::ObsDim, NUM_ACTIONS>,
 ) where
     E: Environment + Clone + 'static,
@@ -189,7 +313,13 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
     let base_seed = config.seed.wrapping_add(thread_id as u64 * 1000);
     let evaluator = GpuEvaluator::<E, NUM_ACTIONS>::new(&*queue);
 
-    let futures: Vec<_> = (0..config.workers_per_thread)
+    // Clone the session's counters for workers.
+    let samples_collected = control.samples_collected.clone();
+    let games_completed = control.games_completed.clone();
+
+    // Create futures once. They live for the entire session.
+    let mut futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> = (0
+        ..config.workers_per_thread)
         .map(|i| {
             let samples_collected = samples_collected.clone();
             let games_completed = games_completed.clone();
@@ -197,37 +327,64 @@ fn run_thread<E, const NUM_ACTIONS: usize>(
             let evaluator_ref = &evaluator;
             let worker_config = &config.worker;
 
-            async move {
-                worker_loop::<E, _, _, NUM_ACTIONS>(
+            let fut = async move {
+                worker_loop_forever::<E, _, _, NUM_ACTIONS>(
                     evaluator_ref,
                     worker_config,
                     &mut rng,
                     samples_collected,
                     games_completed,
-                    target_samples,
                     replay_buffer,
                 )
                 .await;
-            }
+            };
+            Box::pin(fut) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>
         })
         .collect();
 
     let executor = Executor::new(|| queue.listen());
-    reset_executor_counters();
-    executor.run(
-        futures
-            .into_iter()
-            .map(|f| Box::pin(f) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
-            .collect(),
-        || {
-            let done = samples_collected.load(Ordering::Acquire) >= target_samples;
-            if done {
-                queue.notify_all();
-            }
-            done
-        },
-    );
 
-    let counters = take_executor_counters();
-    executor_counters.add(counters);
+    loop {
+        // 1. Wait until running or shutdown.
+        {
+            let mut guard = control
+                .condvar_mutex
+                .lock()
+                .expect("condvar mutex poisoned");
+            while !control.running.load(Ordering::Acquire)
+                && !control.shutdown.load(Ordering::Acquire)
+            {
+                guard = control.condvar.wait(guard).expect("condvar wait failed");
+            }
+        }
+
+        // 2. If shutdown, exit.
+        if control.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        // 3. Increment active_pollers and run executor.
+        control.active_pollers.fetch_add(1, Ordering::AcqRel);
+
+        let control_ref = &control;
+        let queue_ref = &queue;
+        executor.run(&mut futures, &mut || {
+            let should_pause = control_ref.should_pause();
+            if should_pause {
+                queue_ref.notify_all();
+            }
+            // Notify the condvar when samples cross the target so wait_for()
+            // wakes up.
+            if control_ref.samples_collected.load(Ordering::Acquire)
+                >= control_ref.target_samples.load(Ordering::Acquire)
+            {
+                control_ref.wake_all();
+            }
+            should_pause
+        });
+
+        // 4. Decrement active_pollers and notify.
+        control.active_pollers.fetch_sub(1, Ordering::AcqRel);
+        control.wake_all();
+    }
 }
