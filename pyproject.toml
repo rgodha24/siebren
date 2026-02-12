@@ -1,6 +1,6 @@
 [project]
 name = "siebren"
-requires-python = ">=3.8"
+requires-python = ">=3.13,<3.14"
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: Implementation :: CPython",

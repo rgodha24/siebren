@@ -6,6 +6,8 @@ Usage:
     uv run python src/scripts/train.py --game bytefight --epochs 100
 """
 
+# pyright: reportMissingImports=false, reportInvalidTypeForm=false, reportIndexIssue=false, reportAttributeAccessIssue=false
+
 import argparse
 import threading
 import time
@@ -17,6 +19,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 import wandb
 from siebren import (
@@ -132,11 +136,6 @@ class ByteFightNet(nn.Module):
 
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
-        self.register_buffer(
-            "_bit_shifts",
-            torch.arange(8, dtype=torch.uint8).view(1, 8, 1, 1),
-            persistent=False,
-        )
         input_dim = 8 * 16 * 16 + 8 + 18
         self.trunk = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -146,6 +145,22 @@ class ByteFightNet(nn.Module):
         )
         self.policy_head = nn.Linear(hidden_dim, 7)
         self.value_head = nn.Linear(hidden_dim, 1)
+        self._triton_decode_lanes = 256
+        self._triton_decode_num_warps = 4
+        self._decode_out: Optional[torch.Tensor] = None
+
+    def _get_decode_out(self, x: torch.Tensor) -> torch.Tensor:
+        batch = x.shape[0]
+        cached = self._decode_out
+        if (
+            cached is None
+            or cached.device != x.device
+            or cached.dtype != torch.float32
+            or cached.shape[0] < batch
+        ):
+            cached = torch.empty((batch, 2074), dtype=torch.float32, device=x.device)
+            self._decode_out = cached
+        return cached[:batch]
 
     def decode_observation(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
@@ -156,21 +171,19 @@ class ByteFightNet(nn.Module):
             raise ValueError(
                 f"Expected ByteFight obs shape (B, 18, 16), got {tuple(x.shape)}"
             )
+        if not x.is_cuda:
+            raise ValueError("ByteFight decode requires CUDA tensor input")
         if x.dtype != torch.uint8:
             x = x.to(torch.uint8)
 
-        board = x[:, :16, :]
-        meta = x[:, 16:, :].reshape(x.shape[0], 32)
-        direction = meta[:, :8].to(torch.float32)
-        heuristics = (meta[:, 8:26].to(torch.float32) - 128.0) / 127.0
-
-        shifts = cast(torch.Tensor, self._bit_shifts)
-        bitplanes = torch.bitwise_and(
-            torch.bitwise_right_shift(board.unsqueeze(1), shifts),
-            1,
-        ).to(torch.float32)
-
-        return torch.cat((bitplanes.flatten(1), direction, heuristics), dim=1)
+        out = self._get_decode_out(x)
+        _decode_bytefight_triton(
+            x,
+            out,
+            self._triton_decode_lanes,
+            self._triton_decode_num_warps,
+        )
+        return out
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -185,6 +198,59 @@ class ByteFightNet(nn.Module):
         policy = self.policy_head(h)
         value = self.value_head(h).squeeze(-1).tanh()
         return policy, value
+
+
+@triton.jit
+def _bytefight_decode_kernel(
+    obs_ptr,
+    out_ptr,
+    batch,
+    lanes: tl.constexpr,
+):
+    row = tl.program_id(0)
+    seg = tl.program_id(1)
+    lane = tl.arange(0, lanes)
+    mask_row = row < batch
+
+    row_obs_base = row * 288
+    row_out_base = row * 2074
+
+    mask_board = mask_row & (seg < 8)
+    obs_board_idx = row_obs_base + lane
+    cell = tl.load(obs_ptr + obs_board_idx, mask=mask_board, other=0).to(tl.int32)
+    board_val = ((cell >> seg) & 1).to(tl.float32)
+    board_out_idx = row_out_base + seg * 256 + lane
+    tl.store(out_ptr + board_out_idx, board_val, mask=mask_board)
+
+    mask_dir = mask_row & (seg == 8) & (lane < 8)
+    dir_val = tl.load(obs_ptr + row_obs_base + 256 + lane, mask=mask_dir, other=0).to(
+        tl.float32
+    )
+    tl.store(out_ptr + row_out_base + 2048 + lane, dir_val, mask=mask_dir)
+
+    mask_heur = mask_row & (seg == 8) & (lane < 18)
+    heur_q = tl.load(obs_ptr + row_obs_base + 264 + lane, mask=mask_heur, other=128).to(
+        tl.float32
+    )
+    heur_val = (heur_q - 128.0) / 127.0
+    tl.store(out_ptr + row_out_base + 2056 + lane, heur_val, mask=mask_heur)
+
+
+def _decode_bytefight_triton(
+    obs: torch.Tensor,
+    out: torch.Tensor,
+    lanes: int,
+    num_warps: int,
+) -> None:
+    batch = obs.shape[0]
+    grid = (batch, 9)
+    _bytefight_decode_kernel[grid](
+        obs,
+        out,
+        batch,
+        lanes=lanes,
+        num_warps=num_warps,
+    )
 
 
 def save_checkpoint(
