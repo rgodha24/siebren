@@ -194,7 +194,7 @@ impl MapDefinition {
             max_length_reached: self.start_size,
             queued_length: self.start_size.saturating_sub(1),
             traps_this_turn: 0,
-            current_direction: None,
+            current_direction: ByteFightAction::new((rng.next_u64() % 8) as u8),
             segment_queue: VecDeque::from([self.start_a]),
             total_apples: 0,
         };
@@ -203,7 +203,7 @@ impl MapDefinition {
             max_length_reached: self.start_size,
             queued_length: self.start_size.saturating_sub(1),
             traps_this_turn: 0,
-            current_direction: None,
+            current_direction: ByteFightAction::new((rng.next_u64() % 8) as u8),
             segment_queue: VecDeque::from([self.start_b]),
             total_apples: 0,
         };
@@ -501,7 +501,7 @@ impl Board {
             max_length_reached: a_max_length_reached,
             queued_length: a_queued_length,
             traps_this_turn: 0,
-            current_direction: a_direction,
+            current_direction: Some(a_direction.unwrap_or(ByteFightAction::North)),
             segment_queue: a_snake.into_iter().map(Point::from).collect(),
             total_apples: a_apples_eaten,
         };
@@ -510,7 +510,7 @@ impl Board {
             max_length_reached: b_max_length_reached,
             queued_length: b_queued_length,
             traps_this_turn: 0,
-            current_direction: b_direction,
+            current_direction: Some(b_direction.unwrap_or(ByteFightAction::North)),
             segment_queue: b_snake.into_iter().map(Point::from).collect(),
             total_apples: b_apples_eaten,
         };
@@ -672,7 +672,7 @@ impl Board {
         valid_moves
     }
 
-    pub fn heuristics(&self) -> [f32; 18] {
+    pub fn heuristics(&self) -> [u8; 18] {
         let (wall_bitmask, apple_bitmask, snake_a_traps, snake_b_traps) = self.map.bitmasks();
 
         let mut snake_a_obstacle_mask = wall_bitmask.clone();
@@ -724,9 +724,13 @@ impl Board {
         let apples_eaten_diff =
             ((self.snake_a.total_apples as f32) - (self.snake_b.total_apples as f32)) / 10.0;
 
+        let turn_ratio = (self.map.turn_count() as f32 / 2000.0).clamp(0.0, 1.0);
+        let snake_a_reach_ratio = (snake_a_reach as f32 / board_size).clamp(0.0, 1.0);
+        let snake_b_reach_ratio = (snake_b_reach as f32 / board_size).clamp(0.0, 1.0);
+
         if self.is_player_a {
             [
-                self.map.turn_count() as f32 / 2000.0,
+                Self::encode_signed_feature(turn_ratio),
                 self.linorm(distance_between_snakes as f32, 32.0),
                 self.linorm(self.snake_a.length() as f32, 32.0),
                 self.linorm(self.snake_b.length() as f32, 32.0),
@@ -742,15 +746,15 @@ impl Board {
                 self.linorm(self.snake_a.traps_this_turn as f32, 16.0),
                 self.linorm(self.snake_a.max_length_reached as f32, 64.0),
                 self.linorm(self.snake_b.max_length_reached as f32, 64.0),
-                snake_a_reach as f32 / board_size,
-                snake_b_reach as f32 / board_size,
+                Self::encode_signed_feature(snake_a_reach_ratio),
+                Self::encode_signed_feature(snake_b_reach_ratio),
                 self.linorm(apples_eaten_diff, 10.0),
             ][..18]
                 .try_into()
                 .expect("heuristics size")
         } else {
             [
-                self.map.turn_count() as f32 / 2000.0,
+                Self::encode_signed_feature(turn_ratio),
                 self.linorm(distance_between_snakes as f32, 32.0),
                 self.linorm(self.snake_b.length() as f32, 32.0),
                 self.linorm(self.snake_a.length() as f32, 32.0),
@@ -766,8 +770,8 @@ impl Board {
                 self.linorm(self.snake_b.traps_this_turn as f32, 16.0),
                 self.linorm(self.snake_b.max_length_reached as f32, 64.0),
                 self.linorm(self.snake_a.max_length_reached as f32, 64.0),
-                snake_b_reach as f32 / board_size,
-                snake_a_reach as f32 / board_size,
+                Self::encode_signed_feature(snake_b_reach_ratio),
+                Self::encode_signed_feature(snake_a_reach_ratio),
                 self.linorm(-apples_eaten_diff, 10.0),
             ][..18]
                 .try_into()
@@ -1254,21 +1258,30 @@ impl Board {
         (apple_loc, reached_tiles)
     }
 
-    fn linorm(&self, x: f32, softmax: f32) -> f32 {
+    fn linorm(&self, x: f32, softmax: f32) -> u8 {
         let abs_x = x.abs();
-        if abs_x <= softmax {
+        let normalized = if abs_x <= softmax {
             (0.8 / softmax) * x
         } else {
             x.signum() * (1.0 - (0.2 * softmax) / abs_x)
-        }
+        };
+        Self::encode_signed_feature(normalized)
     }
 
-    fn dropnorm(&self, x: f32, softmax: f32) -> f32 {
-        if x <= softmax {
+    fn dropnorm(&self, x: f32, softmax: f32) -> u8 {
+        let normalized = if x <= softmax {
             1.0 - (0.75 / softmax) * x
         } else {
             0.0
-        }
+        };
+        Self::encode_signed_feature(normalized)
+    }
+
+    #[inline]
+    fn encode_signed_feature(value: f32) -> u8 {
+        let clamped = value.clamp(-1.0, 1.0);
+        let quantized = (clamped * 127.0).round() as i16 + 128;
+        quantized.clamp(0, 255) as u8
     }
 }
 

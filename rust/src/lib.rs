@@ -82,7 +82,7 @@ pub mod replay_buffer;
 pub mod training;
 pub mod worker;
 
-use environments::{ByteFight, Connect4, TicTacToe};
+use environments::{bytefight::types as bytefight_types, ByteFight, Connect4, TicTacToe};
 use observation_replay_buffer::ObservationReplayBuffer;
 
 struct ByteFightGraphCacheEntry {
@@ -205,15 +205,19 @@ typed_ephemeral_replay_buffer!(
     7
 );
 
-// ByteFight: observations (16, 16) u8 bit-packed planes, sampled as (n, 16, 16)
+// ByteFight: observations (18, 16) u8, sampled as (n, 18, 16)
 typed_ephemeral_replay_buffer!(
     ByteFightEphemeralReplayBuffer,
     u8,
     Ix2,
     Ix3,
     ByteFight::OBS_SHAPE,
-    |n| Ix3(n, 16, 16),
-    11
+    |n| Ix3(
+        n,
+        bytefight_types::OBS_SERIALIZED_SIDE,
+        bytefight_types::OBS_SERIALIZED_WIDTH,
+    ),
+    7
 );
 
 /// Run TicTacToe self-play with Python model callback.
@@ -499,12 +503,13 @@ fn selfplay_connect4_ephemeral(
 
 /// Run ByteFight self-play with Python model callback.
 ///
-/// The callback receives observations as a (BATCH_SIZE, 16, 16) uint8 numpy array.
-/// Each cell stores 8 one-hot planes packed into bits 0..7.
+/// The callback receives observations as a (BATCH_SIZE, 18, 16) uint8 numpy array.
+/// Layout: first 16x16 bytes are bitpacked board cells, then 8 direction bytes,
+/// then 18 quantized heuristics bytes, then zero padding.
 ///
 /// Returns (policy, value) tuple where:
-/// - policy: (BATCH_SIZE, 11) float32 - action probabilities
-///   Actions: 0-7 = directions (N,NE,E,SE,S,SW,W,NW), 8=Trap, 9=FF, 10=EndTurn
+/// - policy: (BATCH_SIZE, 7) float32 - action probabilities
+///   Actions: 0=Forward, 1=Left, 2=LeftForward, 3=Right, 4=RightForward, 5=Trap, 6=EndTurn
 /// - value: (BATCH_SIZE,) float32 - position evaluations in [-1, 1]
 #[pyfunction]
 #[pyo3(signature = (
@@ -638,13 +643,13 @@ fn selfplay_bytefight_ephemeral(
     let batches_dispatched_ref = batches_dispatched.clone();
     let dispatch = move |batch_idx: usize,
                          obs_view: ArrayView<u8, Ix3>,
-                         completion: queue::BatchCompletion<PolicyValue<11>>| {
+                         completion: queue::BatchCompletion<PolicyValue<7>>| {
         batches_dispatched_ref.fetch_add(1, Ordering::Relaxed);
         runner.dispatch_async(batch_idx, obs_view, completion);
     };
 
     let result =
-        py.detach(|| run_training::<ByteFight, 11, _>(config, replay_buffer.inner(), dispatch));
+        py.detach(|| run_training::<ByteFight, 7, _>(config, replay_buffer.inner(), dispatch));
 
     let stats = PyDict::new(py);
     stats.set_item("poll_rounds", result.executor.poll_rounds)?;

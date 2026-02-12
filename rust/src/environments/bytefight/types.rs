@@ -60,6 +60,37 @@ pub enum ByteFightAction {
     EndTurn = 10,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ByteFightPolicyAction {
+    Forward = 0,
+    Left = 1,
+    LeftForward = 2,
+    Right = 3,
+    RightForward = 4,
+    Trap = 5,
+    EndTurn = 6,
+}
+
+impl ByteFightPolicyAction {
+    pub fn new(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Forward),
+            1 => Some(Self::Left),
+            2 => Some(Self::LeftForward),
+            3 => Some(Self::Right),
+            4 => Some(Self::RightForward),
+            5 => Some(Self::Trap),
+            6 => Some(Self::EndTurn),
+            _ => None,
+        }
+    }
+
+    pub fn to_val(self) -> usize {
+        self as usize
+    }
+}
+
 impl ByteFightAction {
     pub fn new(value: u8) -> Option<Self> {
         match value {
@@ -173,6 +204,12 @@ impl ValidMoves {
 pub const OBS_SIDE: usize = 16;
 pub const OBS_PLANES: usize = 8;
 pub const OBS_CELLS: usize = OBS_SIDE * OBS_SIDE;
+pub const OBS_DIRECTIONS: usize = 8;
+pub const OBS_HEURISTICS: usize = 18;
+pub const OBS_META_BYTES: usize = OBS_DIRECTIONS + OBS_HEURISTICS;
+pub const OBS_SERIALIZED_BYTES: usize = OBS_CELLS + OBS_META_BYTES;
+pub const OBS_SERIALIZED_SIDE: usize = 18;
+pub const OBS_SERIALIZED_WIDTH: usize = 16;
 
 pub type BitpackedObservation = [u8; OBS_CELLS];
 

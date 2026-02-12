@@ -1,4 +1,4 @@
-use ndarray::{ArrayView2, ArrayViewMut, Ix2};
+use ndarray::{ArrayViewMut, Ix2};
 use serde::{Deserialize, Serialize};
 
 use crate::{Environment, GameNotation, Player, TerminalState};
@@ -10,7 +10,45 @@ pub mod snake;
 pub mod types;
 
 pub use pen::{ByteFightPen, PenError};
-pub use types::{ByteFightAction, Point};
+pub use types::{ByteFightAction, ByteFightPolicyAction, Point};
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PolicyValidMoves(u8);
+
+#[derive(Debug, Clone, Copy)]
+struct PolicyValidMovesIter {
+    mask: u8,
+    index: u8,
+}
+
+impl Iterator for PolicyValidMovesIter {
+    type Item = ByteFightPolicyAction;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < ByteFight::NUM_ACTIONS as u8 {
+            let idx = self.index;
+            self.index += 1;
+            if self.mask & (1 << idx) != 0 {
+                return ByteFightPolicyAction::new(idx);
+            }
+        }
+        None
+    }
+}
+
+impl PolicyValidMoves {
+    #[inline]
+    fn add(&mut self, action: ByteFightPolicyAction) {
+        self.0 |= 1 << (action as u8);
+    }
+
+    fn into_iter(self) -> PolicyValidMovesIter {
+        PolicyValidMovesIter {
+            mask: self.0,
+            index: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "ByteFightPen", into = "ByteFightPen")]
@@ -38,23 +76,23 @@ impl From<&ByteFight> for ByteFightPen {
     }
 }
 
-impl crate::Action for ByteFightAction {
+impl crate::Action for ByteFightPolicyAction {
     fn to_index(self) -> usize {
         self as usize
     }
 
     fn from_index(index: usize) -> Option<Self> {
-        ByteFightAction::new(index as u8)
+        ByteFightPolicyAction::new(index as u8)
     }
 }
 
 impl Environment for ByteFight {
     type ObsElem = u8;
     type ObsDim = Ix2;
-    type Action = ByteFightAction;
+    type Action = ByteFightPolicyAction;
     type RollbackState = game::RollbackState;
-    const NUM_ACTIONS: usize = 11;
-    const OBS_SHAPE: Ix2 = Ix2(types::OBS_SIDE, types::OBS_SIDE);
+    const NUM_ACTIONS: usize = 7;
+    const OBS_SHAPE: Ix2 = Ix2(types::OBS_SERIALIZED_SIDE, types::OBS_SERIALIZED_WIDTH);
 
     fn new() -> Self {
         let mut rng = rand::rng();
@@ -71,7 +109,30 @@ impl Environment for ByteFight {
     }
 
     fn valid_actions(&self) -> impl Iterator<Item = Self::Action> {
-        self.board.get_valid_moves().actions()
+        let valid = self.board.get_valid_moves();
+        let mut policy_moves = PolicyValidMoves::default();
+
+        for action in [
+            ByteFightPolicyAction::Forward,
+            ByteFightPolicyAction::Left,
+            ByteFightPolicyAction::LeftForward,
+            ByteFightPolicyAction::Right,
+            ByteFightPolicyAction::RightForward,
+        ] {
+            let absolute = self.policy_to_absolute(action);
+            if valid.contains(absolute) {
+                policy_moves.add(action);
+            }
+        }
+
+        if valid.contains(ByteFightAction::Trap) {
+            policy_moves.add(ByteFightPolicyAction::Trap);
+        }
+        if valid.contains(ByteFightAction::EndTurn) {
+            policy_moves.add(ByteFightPolicyAction::EndTurn);
+        }
+
+        policy_moves.into_iter()
     }
 
     fn current_player(&self) -> Player {
@@ -83,20 +144,72 @@ impl Environment for ByteFight {
     }
 
     fn observation(&self, mut out: ArrayViewMut<u8, Ix2>) {
-        let obs = self.board.bitpacked_observation_16x16();
-        let obs_view = ArrayView2::from_shape((types::OBS_SIDE, types::OBS_SIDE), &obs)
-            .expect("bitpacked observation shape");
-        out.assign(&obs_view);
+        let out_slice = out
+            .as_slice_mut()
+            .expect("bytefight observation output must be contiguous");
+
+        let bitpacked = self.board.bitpacked_observation_16x16();
+        out_slice[..types::OBS_CELLS].copy_from_slice(&bitpacked);
+
+        let mut offset = types::OBS_CELLS;
+        let direction = self.active_direction() as usize;
+        for idx in 0..types::OBS_DIRECTIONS {
+            out_slice[offset + idx] = if idx == direction { 1 } else { 0 };
+        }
+        offset += types::OBS_DIRECTIONS;
+
+        let heuristics = self.board.heuristics();
+        out_slice[offset..offset + types::OBS_HEURISTICS].copy_from_slice(&heuristics);
+        offset += types::OBS_HEURISTICS;
+
+        for byte in &mut out_slice[offset..] {
+            *byte = 0;
+        }
     }
 
     fn apply_action(&mut self, action: Self::Action) -> Self::RollbackState {
+        let absolute = self.policy_to_absolute(action);
         self.board
-            .apply_move(action)
+            .apply_move(absolute)
             .expect("apply_action called with invalid action")
     }
 
     fn rollback(&mut self, rollback: Self::RollbackState) {
         self.board.rollback(rollback);
+    }
+}
+
+impl ByteFight {
+    fn active_direction(&self) -> ByteFightAction {
+        let snake = if self.board.is_player_a {
+            &self.board.snake_a
+        } else {
+            &self.board.snake_b
+        };
+        snake.current_direction.unwrap_or(ByteFightAction::North)
+    }
+
+    fn policy_to_absolute(&self, action: ByteFightPolicyAction) -> ByteFightAction {
+        let direction = self.active_direction() as u8;
+        match action {
+            ByteFightPolicyAction::Forward => {
+                ByteFightAction::new(direction).expect("valid direction")
+            }
+            ByteFightPolicyAction::Left => {
+                ByteFightAction::new((direction + 6) % 8).expect("valid direction")
+            }
+            ByteFightPolicyAction::LeftForward => {
+                ByteFightAction::new((direction + 7) % 8).expect("valid direction")
+            }
+            ByteFightPolicyAction::Right => {
+                ByteFightAction::new((direction + 2) % 8).expect("valid direction")
+            }
+            ByteFightPolicyAction::RightForward => {
+                ByteFightAction::new((direction + 1) % 8).expect("valid direction")
+            }
+            ByteFightPolicyAction::Trap => ByteFightAction::Trap,
+            ByteFightPolicyAction::EndTurn => ByteFightAction::EndTurn,
+        }
     }
 }
 
@@ -125,14 +238,17 @@ mod tests {
 
     #[test]
     fn test_action_trait() {
-        assert_eq!(ByteFightAction::North.to_index(), 0);
-        assert_eq!(ByteFightAction::EndTurn.to_index(), 10);
-        assert_eq!(ByteFightAction::from_index(0), Some(ByteFightAction::North));
+        assert_eq!(ByteFightPolicyAction::Forward.to_index(), 0);
+        assert_eq!(ByteFightPolicyAction::EndTurn.to_index(), 6);
         assert_eq!(
-            ByteFightAction::from_index(10),
-            Some(ByteFightAction::EndTurn)
+            ByteFightPolicyAction::from_index(0),
+            Some(ByteFightPolicyAction::Forward)
         );
-        assert_eq!(ByteFightAction::from_index(11), None);
+        assert_eq!(
+            ByteFightPolicyAction::from_index(6),
+            Some(ByteFightPolicyAction::EndTurn)
+        );
+        assert_eq!(ByteFightPolicyAction::from_index(7), None);
     }
 
     #[test]
@@ -228,5 +344,49 @@ mod tests {
         let notation = game.to_notation();
         let restored = ByteFight::from_notation(&notation).expect("valid notation");
         assert_eq!(notation, restored.to_notation());
+    }
+
+    #[test]
+    fn test_relative_valid_actions_from_direction() {
+        use crate::Environment;
+
+        let game = ByteFight {
+            board: game::Board::new_from_state(
+                (5, 5),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![(2, 2)],
+                1,
+                2,
+                0,
+                Some(ByteFightAction::North),
+                vec![(4, 4)],
+                1,
+                2,
+                0,
+                Some(ByteFightAction::North),
+                0,
+                1,
+                true,
+                0,
+                9999,
+                false,
+            ),
+        };
+
+        let actions: Vec<_> = game.valid_actions().collect();
+        assert_eq!(
+            actions,
+            vec![
+                ByteFightPolicyAction::Forward,
+                ByteFightPolicyAction::Left,
+                ByteFightPolicyAction::LeftForward,
+                ByteFightPolicyAction::Right,
+                ByteFightPolicyAction::RightForward,
+            ]
+        );
     }
 }

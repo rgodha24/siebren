@@ -38,12 +38,12 @@ def _validate_bytefight_tensors(
     batch = obs_host.shape[0]
     if obs_host.shape != obs_device.shape:
         raise ValueError("obs_host/obs_device shape mismatch")
-    if obs_host.shape[1] != 16 or obs_host.shape[2] != 16:
-        raise ValueError("ByteFight obs must be shape (B, 16, 16)")
+    if obs_host.shape[1] != 18 or obs_host.shape[2] != 16:
+        raise ValueError("ByteFight obs must be shape (B, 18, 16)")
     if policy_host.shape != policy_device.shape:
         raise ValueError("policy_host/policy_device shape mismatch")
-    if policy_host.shape[0] != batch or policy_host.shape[1] != 11:
-        raise ValueError("ByteFight policy must be shape (B, 11)")
+    if policy_host.shape[0] != batch or policy_host.shape[1] != 7:
+        raise ValueError("ByteFight policy must be shape (B, 7)")
     if value_host.shape != value_device.shape:
         raise ValueError("value_host/value_device shape mismatch")
     if value_host.shape[0] != batch:

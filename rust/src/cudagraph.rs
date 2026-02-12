@@ -27,9 +27,10 @@ const DL_DEVICE_CUDA: i32 = 2;
 const DL_DTYPE_FLOAT: u8 = 2;
 const DL_DTYPE_UINT: u8 = 1;
 
-const BYTEFIGHT_OBS_SIDE: usize = 16;
-const BYTEFIGHT_OBS_CELLS: usize = BYTEFIGHT_OBS_SIDE * BYTEFIGHT_OBS_SIDE;
-const BYTEFIGHT_ACTIONS: usize = 11;
+const BYTEFIGHT_OBS_SIDE: usize = 18;
+const BYTEFIGHT_OBS_WIDTH: usize = 16;
+const BYTEFIGHT_OBS_CELLS: usize = BYTEFIGHT_OBS_SIDE * BYTEFIGHT_OBS_WIDTH;
+const BYTEFIGHT_ACTIONS: usize = 7;
 
 #[repr(C)]
 struct DLDevice {
@@ -247,7 +248,7 @@ struct LaneCompletionContext {
     policy_host: *const f32,
     value_host: *const f32,
     batch_size: usize,
-    completion: Option<BatchCompletion<PolicyValue<11>>>,
+    completion: Option<BatchCompletion<PolicyValue<7>>>,
 }
 
 unsafe impl Send for LaneCompletionContext {}
@@ -262,7 +263,7 @@ unsafe extern "C" fn lane_completion_callback(user_data: *mut c_void) {
         unsafe { slice::from_raw_parts(ctx.policy_host, ctx.batch_size * BYTEFIGHT_ACTIONS) };
     let value_src = unsafe { slice::from_raw_parts(ctx.value_host, ctx.batch_size) };
 
-    let mut outputs = vec![PolicyValue::<11>::default(); ctx.batch_size];
+    let mut outputs = vec![PolicyValue::<7>::default(); ctx.batch_size];
     for (i, out) in outputs.iter_mut().enumerate() {
         let start = i * BYTEFIGHT_ACTIONS;
         out.policy
@@ -325,7 +326,7 @@ impl ByteFightCudaGraphRunner {
         let obs_shape = [
             batch_size as i64,
             BYTEFIGHT_OBS_SIDE as i64,
-            BYTEFIGHT_OBS_SIDE as i64,
+            BYTEFIGHT_OBS_WIDTH as i64,
         ];
         let policy_shape = [batch_size as i64, BYTEFIGHT_ACTIONS as i64];
         let value_shape = [batch_size as i64];
@@ -446,11 +447,11 @@ impl ByteFightCudaGraphRunner {
         &self,
         batch_idx: usize,
         obs_view: ArrayView<u8, Ix3>,
-        completion: BatchCompletion<PolicyValue<11>>,
+        completion: BatchCompletion<PolicyValue<7>>,
     ) {
         debug_assert_eq!(
             obs_view.shape(),
-            &[self.batch_size, BYTEFIGHT_OBS_SIDE, BYTEFIGHT_OBS_SIDE]
+            &[self.batch_size, BYTEFIGHT_OBS_SIDE, BYTEFIGHT_OBS_WIDTH]
         );
 
         let lane = &self.lanes[batch_idx % self.lanes.len()];

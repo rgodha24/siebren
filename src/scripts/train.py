@@ -128,7 +128,7 @@ class Connect4Net(nn.Module):
 
 
 class ByteFightNet(nn.Module):
-    """MLP for ByteFight bitpacked 16x16 observations (~100k params)."""
+    """MLP for compact ByteFight observations (18x16 uint8)."""
 
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
@@ -137,38 +137,51 @@ class ByteFightNet(nn.Module):
             torch.arange(8, dtype=torch.uint8).view(1, 8, 1, 1),
             persistent=False,
         )
+        input_dim = 8 * 16 * 16 + 8 + 18
         self.trunk = nn.Sequential(
-            nn.Linear(8 * 16 * 16, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
         )
-        self.policy_head = nn.Linear(hidden_dim, 11)
+        self.policy_head = nn.Linear(hidden_dim, 7)
         self.value_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (B, 16, 16) uint8 bitpacked board features
-
-        Returns:
-            policy: (B, 11) action logits (not softmaxed)
-            value: (B,) position evaluation in [-1, 1]
-        """
+    def decode_observation(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(
-                f"Expected ByteFight obs shape (B, 16, 16), got {tuple(x.shape)}"
+                f"Expected ByteFight obs shape (B, 18, 16), got {tuple(x.shape)}"
+            )
+        if x.shape[1] != 18 or x.shape[2] != 16:
+            raise ValueError(
+                f"Expected ByteFight obs shape (B, 18, 16), got {tuple(x.shape)}"
             )
         if x.dtype != torch.uint8:
             x = x.to(torch.uint8)
 
+        board = x[:, :16, :]
+        meta = x[:, 16:, :].reshape(x.shape[0], 32)
+        direction = meta[:, :8].to(torch.float32)
+        heuristics = (meta[:, 8:26].to(torch.float32) - 128.0) / 127.0
+
         shifts = cast(torch.Tensor, self._bit_shifts)
         bitplanes = torch.bitwise_and(
-            torch.bitwise_right_shift(x.unsqueeze(1), shifts),
+            torch.bitwise_right_shift(board.unsqueeze(1), shifts),
             1,
         ).to(torch.float32)
-        x = bitplanes.flatten(1)
-        h = self.trunk(x)
+
+        return torch.cat((bitplanes.flatten(1), direction, heuristics), dim=1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, 18, 16) uint8 compact observations
+
+        Returns:
+            policy: (B, 7) action logits (not softmaxed)
+            value: (B,) position evaluation in [-1, 1]
+        """
+        h = self.trunk(self.decode_observation(x))
         policy = self.policy_head(h)
         value = self.value_head(h).squeeze(-1).tanh()
         return policy, value
@@ -258,7 +271,7 @@ def make_execute_model(
     def execute_model(
         obs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4, (256, 16, 16) for ByteFight
+        # obs: (256, 9) for TicTacToe, (256, 6, 7) for Connect4, (256, 18, 16) for ByteFight
         x = torch.from_numpy(obs).to(device)
         policy_logits, value = model_forward(x)
 
@@ -529,7 +542,7 @@ def train(config: TrainConfig):
     elif config.game == "bytefight":
         hidden_dim = config.hidden_dim if config.hidden_dim is not None else 64
         model = ByteFightNet(hidden_dim=hidden_dim).to(config.device)
-        num_actions = 11
+        num_actions = 7
     else:
         raise ValueError(f"Unknown game: {config.game}")
 
@@ -960,7 +973,6 @@ def main():
         choices=["highest", "high", "medium"],
         help="Set float32 matmul precision (CUDA only)",
     )
-
     args = parser.parse_args()
 
     config = TrainConfig(
