@@ -305,6 +305,7 @@ impl ByteFightCudaGraphRunner {
     pub fn new(
         py: Python<'_>,
         model: Py<PyAny>,
+        gpu_id: usize,
         num_lanes: usize,
         batch_size: usize,
         precision: &str,
@@ -369,18 +370,25 @@ impl ByteFightCudaGraphRunner {
                 obs_host.cast::<c_void>(),
                 &obs_shape,
                 DL_DEVICE_CPU,
-                0,
+                gpu_id as i32,
                 DL_DTYPE_UINT,
                 8,
             )?;
-            let obs_dev_capsule =
-                dlpack_capsule(py, obs_dev, &obs_shape, DL_DEVICE_CUDA, 0, DL_DTYPE_UINT, 8)?;
+            let obs_dev_capsule = dlpack_capsule(
+                py,
+                obs_dev,
+                &obs_shape,
+                DL_DEVICE_CUDA,
+                gpu_id as i32,
+                DL_DTYPE_UINT,
+                8,
+            )?;
             let policy_host_capsule = dlpack_capsule(
                 py,
                 policy_host.cast::<c_void>(),
                 &policy_shape,
                 DL_DEVICE_CPU,
-                0,
+                gpu_id as i32,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -389,7 +397,7 @@ impl ByteFightCudaGraphRunner {
                 policy_dev,
                 &policy_shape,
                 DL_DEVICE_CUDA,
-                0,
+                gpu_id as i32,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -398,7 +406,7 @@ impl ByteFightCudaGraphRunner {
                 value_host.cast::<c_void>(),
                 &value_shape,
                 DL_DEVICE_CPU,
-                0,
+                gpu_id as i32,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -407,7 +415,7 @@ impl ByteFightCudaGraphRunner {
                 value_dev,
                 &value_shape,
                 DL_DEVICE_CUDA,
-                0,
+                gpu_id as i32,
                 DL_DTYPE_FLOAT,
                 32,
             )?;

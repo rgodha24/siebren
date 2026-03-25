@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::{fmt::Debug, hash::Hash};
@@ -87,7 +88,8 @@ struct ByteFightGraphCacheEntry {
     model_ptr: usize,
     num_batches: usize,
     precision: String,
-    runner: Arc<cudagraph::ByteFightCudaGraphRunner>,
+    num_gpus: usize,
+    runners: HashMap<usize, Arc<cudagraph::ByteFightCudaGraphRunner>>,
 }
 
 static BYTEFIGHT_GRAPH_CACHE: OnceLock<Mutex<Option<ByteFightGraphCacheEntry>>> = OnceLock::new();
@@ -461,7 +463,8 @@ impl ByteFightSelfPlay {
         temperature = 1.0,
         exploration_moves = 30,
         model,
-        selfplay_precision = "fp32"
+        selfplay_precision = "fp32",
+        num_gpus = 1
     ))]
     fn new(
         py: Python<'_>,
@@ -477,6 +480,7 @@ impl ByteFightSelfPlay {
         exploration_moves: usize,
         model: Py<PyAny>,
         selfplay_precision: &str,
+        num_gpus: usize,
     ) -> PyResult<Self> {
         use cudagraph::ByteFightCudaGraphRunner;
         use eval::PolicyValue;
@@ -537,8 +541,8 @@ impl ByteFightSelfPlay {
         let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
         let model_ptr = model.bind(py).as_ptr() as usize;
 
-        // Build or reuse the CUDA graph runner.
-        let runner = {
+        // Build or reuse the CUDA graph runners.
+        let runners = {
             let cache = bytefight_graph_cache();
             let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
 
@@ -547,30 +551,37 @@ impl ByteFightSelfPlay {
                     entry.model_ptr != model_ptr
                         || entry.num_batches != num_batches
                         || entry.precision != selfplay_precision
+                        || entry.num_gpus != num_gpus
                 }
                 None => true,
             };
 
             if needs_rebuild {
-                let runner = Arc::new(ByteFightCudaGraphRunner::new(
-                    py,
-                    model.clone_ref(py),
-                    num_batches,
-                    BATCH_SIZE,
-                    selfplay_precision,
-                )?);
+                let mut runners = HashMap::new();
+                for gpu_id in 0..num_gpus {
+                    let runner = Arc::new(ByteFightCudaGraphRunner::new(
+                        py,
+                        model.clone_ref(py),
+                        gpu_id,
+                        num_batches,
+                        BATCH_SIZE,
+                        selfplay_precision,
+                    )?);
+                    runners.insert(gpu_id, runner);
+                }
                 *guard = Some(ByteFightGraphCacheEntry {
                     model_ptr,
                     num_batches,
                     precision: selfplay_precision.to_string(),
-                    runner: runner.clone(),
+                    num_gpus,
+                    runners: runners.clone(),
                 });
-                runner
+                runners
             } else {
                 guard
                     .as_ref()
-                    .expect("cached runner should exist")
-                    .runner
+                    .expect("cached runners should exist")
+                    .runners
                     .clone()
             }
         };
@@ -579,7 +590,8 @@ impl ByteFightSelfPlay {
             move |batch_idx: usize,
                   obs_view: ArrayView<u8, Ix3>,
                   completion: queue::BatchCompletion<PolicyValue<7>>| {
-                runner.dispatch_async(batch_idx, obs_view, completion);
+                let gpu_id = batch_idx % num_gpus;
+                runners[&gpu_id].dispatch_async(batch_idx, obs_view, completion);
             };
 
         let session = SelfPlaySession::new::<ByteFight, 7, _>(
