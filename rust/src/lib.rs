@@ -561,7 +561,7 @@ impl ByteFightSelfPlay {
                 let deepcopy = copy.getattr("deepcopy").unwrap();
                 let mut runners = HashMap::new();
                 for gpu_id in 0..num_gpus {
-                    let model_copy = deepcopy.call1((model.clone_ref(py),)).unwrap();
+                    let model_copy = deepcopy.call1((model.clone_ref(py),)).unwrap().into();
                     let runner = Arc::new(ByteFightCudaGraphRunner::new(
                         py,
                         model_copy,
