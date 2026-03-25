@@ -177,12 +177,13 @@ class ByteFightNet(nn.Module):
             x = x.to(torch.uint8)
 
         out = self._get_decode_out(x)
-        _decode_bytefight_triton(
-            x,
-            out,
-            self._triton_decode_lanes,
-            self._triton_decode_num_warps,
-        )
+        with torch.cuda.device(x.device):
+            _decode_bytefight_triton(
+                x,
+                out,
+                self._triton_decode_lanes,
+                self._triton_decode_num_warps,
+            )
         return out
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -512,6 +513,8 @@ def train_step(
     model.train()
 
     model_device = next(model.parameters()).device
+    if model_device.type == "cuda":
+        torch.cuda.set_device(model_device)
 
     # Sample from replay buffer
     obs, policies, values = replay_buffer.sample(batch_size, step)
