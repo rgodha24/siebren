@@ -63,6 +63,7 @@ class TrainConfig:
     selfplay_backend: str = "rust-cudagraph"
     selfplay_precision: str = "fp16"
     matmul_precision: str = "high"
+    num_gpus: int = 0  # 0 means auto-detect from torch.cuda.device_count()
 
 
 class TicTacToeNet(nn.Module):
@@ -652,6 +653,7 @@ def train(config: TrainConfig):
     )
     if config.game == "bytefight":
         # ByteFight uses the Rust CUDA graph runner for dispatch.
+        num_gpus = config.num_gpus if config.num_gpus > 0 else torch.cuda.device_count()
         selfplay = SelfPlay(
             game=config.game,
             replay_buffer=replay_buffer,
@@ -666,6 +668,7 @@ def train(config: TrainConfig):
             seed=config.seed,
             model=model,
             selfplay_precision=config.selfplay_precision,
+            num_gpus=num_gpus,
         )
     else:
         # Other games use a Python callback for inference.
@@ -984,6 +987,12 @@ def main():
         choices=["highest", "high", "medium"],
         help="Set float32 matmul precision (CUDA only)",
     )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=0,
+        help="Number of GPUs for self-play (0=auto-detect via torch.cuda.device_count())",
+    )
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -1019,6 +1028,7 @@ def main():
         selfplay_backend=args.selfplay_backend,
         selfplay_precision=args.selfplay_precision,
         matmul_precision=args.matmul_precision,
+        num_gpus=args.num_gpus,
     )
 
     train(config)
