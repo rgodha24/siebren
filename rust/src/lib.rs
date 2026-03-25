@@ -557,11 +557,14 @@ impl ByteFightSelfPlay {
             };
 
             if needs_rebuild {
+                let copy = py.import("copy").unwrap();
+                let deepcopy = copy.getattr("deepcopy").unwrap();
                 let mut runners = HashMap::new();
                 for gpu_id in 0..num_gpus {
+                    let model_copy = deepcopy.call1((model.clone_ref(py),)).unwrap();
                     let runner = Arc::new(ByteFightCudaGraphRunner::new(
                         py,
-                        model.clone_ref(py),
+                        model_copy,
                         gpu_id,
                         num_batches,
                         BATCH_SIZE,
