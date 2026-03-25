@@ -653,7 +653,16 @@ def train(config: TrainConfig):
     )
     if config.game == "bytefight":
         # ByteFight uses the Rust CUDA graph runner for dispatch.
-        num_gpus = config.num_gpus if config.num_gpus > 0 else torch.cuda.device_count()
+        available_gpus = torch.cuda.device_count()
+        if available_gpus < 1:
+            raise RuntimeError(
+                "bytefight rust-cudagraph self-play requires at least one CUDA GPU"
+            )
+        num_gpus = config.num_gpus if config.num_gpus > 0 else available_gpus
+        if num_gpus > available_gpus:
+            raise ValueError(
+                f"Requested --num-gpus={num_gpus}, but only {available_gpus} GPUs are visible"
+            )
         selfplay = SelfPlay(
             game=config.game,
             replay_buffer=replay_buffer,

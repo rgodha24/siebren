@@ -69,6 +69,8 @@ class SelfPlay:
                 raise ValueError(
                     "bytefight self-play requires a CUDA model for rust-cudagraph backend"
                 )
+            if num_gpus < 1:
+                raise ValueError(f"num_gpus must be >= 1 for bytefight, got {num_gpus}")
             self._session = _native.ByteFightSelfPlay(
                 replay_buffer._inner,
                 num_threads,

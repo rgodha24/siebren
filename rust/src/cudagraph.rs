@@ -179,6 +179,34 @@ fn check_cuda_or_panic(code: CudaError, context: &str) {
     }
 }
 
+fn validate_cuda_device(gpu_id: usize) -> PyResult<i32> {
+    let gpu_device_id = i32::try_from(gpu_id)
+        .map_err(|_| PyErr::new::<PyRuntimeError, _>("gpu_id must fit in i32"))?;
+
+    let mut device_count = 0i32;
+    unsafe {
+        check_cuda(
+            cuda::cudaGetDeviceCount(&mut device_count as *mut i32),
+            "cudaGetDeviceCount",
+        )?;
+    }
+
+    if device_count <= 0 {
+        return Err(PyErr::new::<PyRuntimeError, _>(
+            "no CUDA devices available for ByteFight CUDA graph runner",
+        ));
+    }
+
+    if gpu_device_id >= device_count {
+        return Err(PyErr::new::<PyRuntimeError, _>(format!(
+            "gpu_id {} out of range for {} CUDA devices",
+            gpu_id, device_count
+        )));
+    }
+
+    Ok(gpu_device_id)
+}
+
 fn cuda_malloc_host_f32(count: usize, context: &str) -> PyResult<*mut f32> {
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let bytes = count
@@ -232,6 +260,7 @@ fn cuda_malloc_device_u8(count: usize, context: &str) -> PyResult<*mut c_void> {
 }
 
 struct ByteFightCudaGraphLane {
+    gpu_device_id: i32,
     stream: cudaStream_t,
     graph_exec: cudaGraphExec_t,
     /// Owns Python-side graph/tensor objects for this lane.
@@ -279,6 +308,7 @@ unsafe extern "C" fn lane_completion_callback(user_data: *mut c_void) {
 impl Drop for ByteFightCudaGraphLane {
     fn drop(&mut self) {
         unsafe {
+            let _ = cuda::cudaSetDevice(self.gpu_device_id);
             let _ = cuda::cudaFree(self.obs_dev);
             let _ = cuda::cudaFree(self.policy_dev);
             let _ = cuda::cudaFree(self.value_dev);
@@ -292,6 +322,7 @@ impl Drop for ByteFightCudaGraphLane {
 
 /// Per-lane CUDA graph executor for ByteFight self-play inference.
 pub struct ByteFightCudaGraphRunner {
+    gpu_device_id: i32,
     batch_size: usize,
     lanes: Vec<ByteFightCudaGraphLane>,
 }
@@ -315,6 +346,14 @@ impl ByteFightCudaGraphRunner {
         }
         if batch_size == 0 {
             return Err(PyErr::new::<PyRuntimeError, _>("batch_size must be > 0"));
+        }
+
+        let gpu_device_id = validate_cuda_device(gpu_id)?;
+        unsafe {
+            check_cuda(
+                cuda::cudaSetDevice(gpu_device_id),
+                "cudaSetDevice in ByteFightCudaGraphRunner::new",
+            )?;
         }
 
         let module = PyModule::import(py, "siebren.cudagraph_backend")?;
@@ -370,7 +409,7 @@ impl ByteFightCudaGraphRunner {
                 obs_host.cast::<c_void>(),
                 &obs_shape,
                 DL_DEVICE_CPU,
-                gpu_id as i32,
+                0,
                 DL_DTYPE_UINT,
                 8,
             )?;
@@ -379,7 +418,7 @@ impl ByteFightCudaGraphRunner {
                 obs_dev,
                 &obs_shape,
                 DL_DEVICE_CUDA,
-                gpu_id as i32,
+                gpu_device_id,
                 DL_DTYPE_UINT,
                 8,
             )?;
@@ -388,7 +427,7 @@ impl ByteFightCudaGraphRunner {
                 policy_host.cast::<c_void>(),
                 &policy_shape,
                 DL_DEVICE_CPU,
-                gpu_id as i32,
+                0,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -397,7 +436,7 @@ impl ByteFightCudaGraphRunner {
                 policy_dev,
                 &policy_shape,
                 DL_DEVICE_CUDA,
-                gpu_id as i32,
+                gpu_device_id,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -406,7 +445,7 @@ impl ByteFightCudaGraphRunner {
                 value_host.cast::<c_void>(),
                 &value_shape,
                 DL_DEVICE_CPU,
-                gpu_id as i32,
+                0,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -415,7 +454,7 @@ impl ByteFightCudaGraphRunner {
                 value_dev,
                 &value_shape,
                 DL_DEVICE_CUDA,
-                gpu_id as i32,
+                gpu_device_id,
                 DL_DTYPE_FLOAT,
                 32,
             )?;
@@ -436,6 +475,7 @@ impl ByteFightCudaGraphRunner {
                 .extract()?;
 
             let lane = ByteFightCudaGraphLane {
+                gpu_device_id,
                 stream,
                 graph_exec: exec_handle as cudaGraphExec_t,
                 _py_owner: py_owner,
@@ -449,7 +489,11 @@ impl ByteFightCudaGraphRunner {
             lanes.push(lane);
         }
 
-        Ok(Self { batch_size, lanes })
+        Ok(Self {
+            gpu_device_id,
+            batch_size,
+            lanes,
+        })
     }
 
     pub fn dispatch_async(
@@ -474,6 +518,10 @@ impl ByteFightCudaGraphRunner {
         obs_dst.copy_from_slice(obs_src);
 
         unsafe {
+            check_cuda_or_panic(
+                cuda::cudaSetDevice(self.gpu_device_id),
+                "cudaSetDevice before cudaGraphLaunch",
+            );
             check_cuda_or_panic(
                 cuda::cudaGraphLaunch(lane.graph_exec, lane.stream),
                 "cudaGraphLaunch",

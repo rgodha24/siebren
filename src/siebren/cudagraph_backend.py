@@ -11,6 +11,7 @@ def _validate_bytefight_tensors(
     policy_device: torch.Tensor,
     value_host: torch.Tensor,
     value_device: torch.Tensor,
+    gpu_id: int,
 ) -> None:
     if obs_host.device.type != "cpu":
         raise ValueError("obs_host must be a CPU tensor")
@@ -49,6 +50,14 @@ def _validate_bytefight_tensors(
     if value_host.shape[0] != batch:
         raise ValueError("ByteFight value must be shape (B,)")
 
+    for name, tensor in (
+        ("obs_device", obs_device),
+        ("policy_device", policy_device),
+        ("value_device", value_device),
+    ):
+        if tensor.device.index != gpu_id:
+            raise ValueError(f"{name} must be on cuda:{gpu_id}, got {tensor.device}")
+
 
 def _autocast_dtype(precision: str) -> Optional[torch.dtype]:
     if precision == "fp32":
@@ -74,6 +83,9 @@ def capture_bytefight_lane_graph(
     precision: str = "fp32",
     gpu_id: int = 0,
 ) -> tuple[int, object]:
+    if gpu_id < 0:
+        raise ValueError(f"gpu_id must be >= 0, got {gpu_id}")
+
     obs_host = dlpack.from_dlpack(obs_host_dlpack)
     obs_device = dlpack.from_dlpack(obs_device_dlpack)
     policy_host = dlpack.from_dlpack(policy_host_dlpack)
@@ -88,45 +100,50 @@ def capture_bytefight_lane_graph(
         policy_device,
         value_host,
         value_device,
+        gpu_id,
     )
 
-    model = model.to(f"cuda:{gpu_id}")
-    model.eval()
-    stream = torch.cuda.ExternalStream(stream_handle)
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    dtype = _autocast_dtype(precision)
+    with torch.cuda.device(gpu_id):
+        model = model.to(f"cuda:{gpu_id}")
+        model.eval()
+        stream = torch.cuda.ExternalStream(stream_handle)
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        dtype = _autocast_dtype(precision)
 
-    def run_step() -> None:
-        obs_device.copy_(obs_host, non_blocking=True)
-        if dtype is None:
-            logits, value = model(obs_device)
-        else:
-            with torch.autocast(device_type="cuda", dtype=dtype):
+        def run_step() -> None:
+            obs_device.copy_(obs_host, non_blocking=True)
+            if dtype is None:
                 logits, value = model(obs_device)
-        probs = torch.softmax(logits, dim=-1)
-        policy_device.copy_(probs, non_blocking=True)
-        value_device.copy_(value, non_blocking=True)
-        policy_host.copy_(policy_device, non_blocking=True)
-        value_host.copy_(value_device, non_blocking=True)
+            else:
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    logits, value = model(obs_device)
+            probs = torch.softmax(logits, dim=-1)
+            policy_device.copy_(probs, non_blocking=True)
+            value_device.copy_(value, non_blocking=True)
+            policy_host.copy_(policy_device, non_blocking=True)
+            value_host.copy_(value_device, non_blocking=True)
 
-    with torch.inference_mode():
-        with torch.cuda.stream(stream):
-            for _ in range(3):
+        with torch.inference_mode():
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    run_step()
+            torch.cuda.synchronize(device=gpu_id)
+
+            with torch.cuda.graph(
+                graph, stream=stream, capture_error_mode="thread_local"
+            ):
                 run_step()
 
-        with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
-            run_step()
-
-    graph.instantiate()
-    owner = (
-        graph,
-        model,
-        obs_host,
-        obs_device,
-        policy_host,
-        policy_device,
-        value_host,
-        value_device,
-        stream,
-    )
-    return int(graph.raw_cuda_graph_exec()), owner
+        graph.instantiate()
+        owner = (
+            graph,
+            model,
+            obs_host,
+            obs_device,
+            policy_host,
+            policy_device,
+            value_host,
+            value_device,
+            stream,
+        )
+        return int(graph.raw_cuda_graph_exec()), owner
