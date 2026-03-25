@@ -40,6 +40,7 @@ class SelfPlay:
         ] = None,
         model: Optional[Any] = None,
         selfplay_precision: str = "fp32",
+        num_gpus: int = 1,
     ) -> None:
         self.game = _normalize_game(game)
         total_workers = num_threads * workers_per_thread
@@ -81,6 +82,7 @@ class SelfPlay:
                 exploration_moves=exploration_moves,
                 model=model,
                 selfplay_precision=selfplay_precision,
+                num_gpus=num_gpus,
             )
         else:
             if execute_model is None:
