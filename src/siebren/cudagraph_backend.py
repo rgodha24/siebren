@@ -111,9 +111,11 @@ def capture_bytefight_lane_graph(
 
     with torch.inference_mode():
         with torch.cuda.stream(stream):
-            for _ in range(3):
+            for i in range(3):
                 run_step()
-        torch.cuda.synchronize()
+                if i == 0:
+                    torch.cuda.synchronize()
+                    print(f"[cuda:{gpu_id}] warmup iter {i} done")
 
         with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
             run_step()
