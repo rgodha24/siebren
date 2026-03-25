@@ -74,6 +74,7 @@ def capture_bytefight_lane_graph(
     precision: str = "fp32",
     gpu_id: int = 0,
 ) -> tuple[int, object]:
+    print(f"[cuda:{gpu_id}] capture_bytefight_lane_graph called")
     obs_host = dlpack.from_dlpack(obs_host_dlpack)
     obs_device = dlpack.from_dlpack(obs_device_dlpack)
     policy_host = dlpack.from_dlpack(policy_host_dlpack)
