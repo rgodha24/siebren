@@ -72,6 +72,7 @@ def capture_bytefight_lane_graph(
     value_device_dlpack,
     stream_handle: int,
     precision: str = "fp32",
+    gpu_id: int = 0,
 ) -> tuple[int, object]:
     obs_host = dlpack.from_dlpack(obs_host_dlpack)
     obs_device = dlpack.from_dlpack(obs_device_dlpack)
@@ -89,6 +90,7 @@ def capture_bytefight_lane_graph(
         value_device,
     )
 
+    model = model.to(f"cuda:{gpu_id}")
     model.eval()
     stream = torch.cuda.ExternalStream(stream_handle)
     graph = torch.cuda.CUDAGraph(keep_graph=True)

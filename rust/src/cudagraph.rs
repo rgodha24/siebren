@@ -431,6 +431,7 @@ impl ByteFightCudaGraphRunner {
                     value_dev_capsule,
                     stream as u64,
                     precision,
+                    gpu_id,
                 ))?
                 .extract()?;
 
