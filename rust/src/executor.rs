@@ -75,12 +75,20 @@ impl<'a> Executor<'a> {
 
             // Poll all futures until no progress
             loop {
+                if cancel() || futures.is_empty() {
+                    return;
+                }
+
                 // Clear progress flag before polling round
                 take_progress();
 
                 // Poll all pending futures
                 let mut i = 0;
                 while i < futures.len() {
+                    if cancel() {
+                        return;
+                    }
+
                     let poll_result = futures[i].as_mut().poll(&mut cx);
                     match poll_result {
                         Poll::Ready(()) => {
@@ -91,6 +99,10 @@ impl<'a> Executor<'a> {
                             i += 1;
                         }
                     }
+                }
+
+                if cancel() || futures.is_empty() {
+                    return;
                 }
 
                 // If no progress was made, break to park
@@ -310,6 +322,36 @@ mod tests {
 
         notify_thread.join().unwrap();
         assert!(completed.get());
+    }
+
+    #[test]
+    fn test_executor_checks_cancel_during_progress_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_for_future = polls.clone();
+
+        let fut = std::future::poll_fn(move |_cx| {
+            let n = polls_for_future.fetch_add(1, Ordering::Relaxed) + 1;
+            if n < 1000 {
+                signal_progress();
+            }
+            Poll::<()>::Pending
+        });
+
+        let executor = Executor::new(|| event_listener::Event::new().listen());
+        let polls_for_cancel = polls.clone();
+        executor.run(&mut vec![Box::pin(fut)], &mut || {
+            polls_for_cancel.load(Ordering::Relaxed) >= 10
+        });
+
+        // If cancel is only checked outside the inner progress loop,
+        // this would be close to 1000 polls before returning.
+        assert!(
+            polls.load(Ordering::Relaxed) < 100,
+            "cancel should stop polling quickly"
+        );
     }
 
     #[test]

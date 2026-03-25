@@ -63,6 +63,7 @@ class TrainConfig:
     selfplay_backend: str = "rust-cudagraph"
     selfplay_precision: str = "fp16"
     matmul_precision: str = "high"
+    num_gpus: int = 0  # 0 means auto-detect from torch.cuda.device_count()
 
 
 class TicTacToeNet(nn.Module):
@@ -176,12 +177,13 @@ class ByteFightNet(nn.Module):
             x = x.to(torch.uint8)
 
         out = self._get_decode_out(x)
-        _decode_bytefight_triton(
-            x,
-            out,
-            self._triton_decode_lanes,
-            self._triton_decode_num_warps,
-        )
+        with torch.cuda.device(x.device):
+            _decode_bytefight_triton(
+                x,
+                out,
+                self._triton_decode_lanes,
+                self._triton_decode_num_warps,
+            )
         return out
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -502,7 +504,7 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     replay_buffer: EphemeralReplayBuffer,
     batch_size: int,
-    device: str,
+    _device: str,
     step: int,
     value_loss_weight: float,
     l2_weight: float,
@@ -510,13 +512,17 @@ def train_step(
     """One training step. Returns dict of losses."""
     model.train()
 
+    model_device = next(model.parameters()).device
+    if model_device.type == "cuda":
+        torch.cuda.set_device(model_device)
+
     # Sample from replay buffer
     obs, policies, values = replay_buffer.sample(batch_size, step)
 
     # Move to device
-    obs = torch.from_numpy(obs).to(device)
-    target_policies = torch.from_numpy(policies).to(device)
-    target_values = torch.from_numpy(values).to(device)
+    obs = torch.from_numpy(obs).to(model_device)
+    target_policies = torch.from_numpy(policies).to(model_device)
+    target_values = torch.from_numpy(values).to(model_device)
 
     # Forward pass
     pred_logits, pred_values = model(obs)
@@ -544,10 +550,10 @@ def train_step(
         if corr_denom.item() > 1e-8:
             value_corr = (pred_centered * target_centered).mean() / corr_denom
         else:
-            value_corr = torch.zeros((), device=device)
+            value_corr = torch.zeros((), device=model_device)
 
     # L2 regularization
-    l2_loss = torch.zeros((), device=device)
+    l2_loss = torch.zeros((), device=model_device)
     if l2_weight > 0.0:
         for param in model.parameters():
             if param.requires_grad:
@@ -652,6 +658,16 @@ def train(config: TrainConfig):
     )
     if config.game == "bytefight":
         # ByteFight uses the Rust CUDA graph runner for dispatch.
+        available_gpus = torch.cuda.device_count()
+        if available_gpus < 1:
+            raise RuntimeError(
+                "bytefight rust-cudagraph self-play requires at least one CUDA GPU"
+            )
+        num_gpus = config.num_gpus if config.num_gpus > 0 else available_gpus
+        if num_gpus > available_gpus:
+            raise ValueError(
+                f"Requested --num-gpus={num_gpus}, but only {available_gpus} GPUs are visible"
+            )
         selfplay = SelfPlay(
             game=config.game,
             replay_buffer=replay_buffer,
@@ -666,6 +682,7 @@ def train(config: TrainConfig):
             seed=config.seed,
             model=model,
             selfplay_precision=config.selfplay_precision,
+            num_gpus=num_gpus,
         )
     else:
         # Other games use a Python callback for inference.
@@ -984,6 +1001,12 @@ def main():
         choices=["highest", "high", "medium"],
         help="Set float32 matmul precision (CUDA only)",
     )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=0,
+        help="Number of GPUs for self-play (0=auto-detect via torch.cuda.device_count())",
+    )
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -1019,6 +1042,7 @@ def main():
         selfplay_backend=args.selfplay_backend,
         selfplay_precision=args.selfplay_precision,
         matmul_precision=args.matmul_precision,
+        num_gpus=args.num_gpus,
     )
 
     train(config)

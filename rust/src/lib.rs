@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::{fmt::Debug, hash::Hash};
@@ -87,7 +88,9 @@ struct ByteFightGraphCacheEntry {
     model_ptr: usize,
     num_batches: usize,
     precision: String,
-    runner: Arc<cudagraph::ByteFightCudaGraphRunner>,
+    num_gpus: usize,
+    runners: HashMap<usize, Arc<cudagraph::ByteFightCudaGraphRunner>>,
+    models: HashMap<usize, Py<PyAny>>,
 }
 
 static BYTEFIGHT_GRAPH_CACHE: OnceLock<Mutex<Option<ByteFightGraphCacheEntry>>> = OnceLock::new();
@@ -443,6 +446,8 @@ typed_selfplay!(
 #[pyclass]
 struct ByteFightSelfPlay {
     session: Option<training::SelfPlaySession>,
+    source_model: Py<PyAny>,
+    source_model_ptr: usize,
 }
 
 #[pymethods]
@@ -461,7 +466,8 @@ impl ByteFightSelfPlay {
         temperature = 1.0,
         exploration_moves = 30,
         model,
-        selfplay_precision = "fp32"
+        selfplay_precision = "fp32",
+        num_gpus = 1
     ))]
     fn new(
         py: Python<'_>,
@@ -477,6 +483,7 @@ impl ByteFightSelfPlay {
         exploration_moves: usize,
         model: Py<PyAny>,
         selfplay_precision: &str,
+        num_gpus: usize,
     ) -> PyResult<Self> {
         use cudagraph::ByteFightCudaGraphRunner;
         use eval::PolicyValue;
@@ -510,6 +517,11 @@ impl ByteFightSelfPlay {
                 "temperature must be >= 0",
             ));
         }
+        if num_gpus == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "num_gpus must be >= 1",
+            ));
+        }
 
         let config = SessionConfig {
             num_threads,
@@ -537,8 +549,8 @@ impl ByteFightSelfPlay {
         let (num_batches, _total_slots) = queue_shape_for_workers(total_workers);
         let model_ptr = model.bind(py).as_ptr() as usize;
 
-        // Build or reuse the CUDA graph runner.
-        let runner = {
+        // Build or reuse the CUDA graph runners.
+        let runners = {
             let cache = bytefight_graph_cache();
             let mut guard = cache.lock().expect("bytefight graph cache mutex poisoned");
 
@@ -547,30 +559,43 @@ impl ByteFightSelfPlay {
                     entry.model_ptr != model_ptr
                         || entry.num_batches != num_batches
                         || entry.precision != selfplay_precision
+                        || entry.num_gpus != num_gpus
                 }
                 None => true,
             };
 
             if needs_rebuild {
-                let runner = Arc::new(ByteFightCudaGraphRunner::new(
-                    py,
-                    model.clone_ref(py),
-                    num_batches,
-                    BATCH_SIZE,
-                    selfplay_precision,
-                )?);
+                let copy = py.import("copy")?;
+                let deepcopy = copy.getattr("deepcopy")?;
+                let mut runners = HashMap::new();
+                let mut models = HashMap::new();
+                for gpu_id in 0..num_gpus {
+                    let model_copy: Py<PyAny> = deepcopy.call1((model.clone_ref(py),))?.into();
+                    let runner = Arc::new(ByteFightCudaGraphRunner::new(
+                        py,
+                        model_copy.clone_ref(py),
+                        gpu_id,
+                        num_batches,
+                        BATCH_SIZE,
+                        selfplay_precision,
+                    )?);
+                    runners.insert(gpu_id, runner);
+                    models.insert(gpu_id, model_copy);
+                }
                 *guard = Some(ByteFightGraphCacheEntry {
                     model_ptr,
                     num_batches,
                     precision: selfplay_precision.to_string(),
-                    runner: runner.clone(),
+                    num_gpus,
+                    runners: runners.clone(),
+                    models,
                 });
-                runner
+                runners
             } else {
                 guard
                     .as_ref()
-                    .expect("cached runner should exist")
-                    .runner
+                    .expect("cached runners should exist")
+                    .runners
                     .clone()
             }
         };
@@ -579,7 +604,8 @@ impl ByteFightSelfPlay {
             move |batch_idx: usize,
                   obs_view: ArrayView<u8, Ix3>,
                   completion: queue::BatchCompletion<PolicyValue<7>>| {
-                runner.dispatch_async(batch_idx, obs_view, completion);
+                let gpu_id = batch_idx % num_gpus;
+                runners[&gpu_id].dispatch_async(batch_idx, obs_view, completion);
             };
 
         let session = SelfPlaySession::new::<ByteFight, 7, _>(
@@ -590,11 +616,14 @@ impl ByteFightSelfPlay {
 
         Ok(Self {
             session: Some(session),
+            source_model: model,
+            source_model_ptr: model_ptr,
         })
     }
 
     /// Start self-play with no sample limit.
-    fn start(&self) -> PyResult<()> {
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        self.sync_model_replicas(py)?;
         self.session
             .as_ref()
             .ok_or_else(|| {
@@ -609,6 +638,7 @@ impl ByteFightSelfPlay {
         let session = self.session.as_ref().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("session already dropped")
         })?;
+        self.sync_model_replicas(py)?;
         let result = py.detach(|| session.wait_for(target_samples));
         Ok(result)
     }
@@ -630,6 +660,50 @@ impl ByteFightSelfPlay {
         if let Some(mut session) = self.session.take() {
             session.shutdown();
         }
+    }
+}
+
+impl ByteFightSelfPlay {
+    fn sync_model_replicas(&self, py: Python<'_>) -> PyResult<()> {
+        let replicas = {
+            let cache = bytefight_graph_cache();
+            let guard = cache.lock().expect("bytefight graph cache mutex poisoned");
+            let entry = guard.as_ref().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "bytefight graph cache missing while syncing model replicas",
+                )
+            })?;
+
+            if entry.model_ptr != self.source_model_ptr {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "bytefight graph cache model mismatch while syncing model replicas",
+                ));
+            }
+
+            let mut models: Vec<(usize, Py<PyAny>)> = entry
+                .models
+                .iter()
+                .map(|(gpu_id, model)| (*gpu_id, model.clone_ref(py)))
+                .collect();
+            models.sort_by_key(|(gpu_id, _)| *gpu_id);
+            models
+                .into_iter()
+                .map(|(_, model)| model)
+                .collect::<Vec<_>>()
+        };
+
+        let state_dict: Py<PyAny> = self
+            .source_model
+            .bind(py)
+            .call_method0("state_dict")?
+            .into();
+        for replica in replicas {
+            let _ = replica
+                .bind(py)
+                .call_method1("load_state_dict", (state_dict.clone_ref(py),))?;
+        }
+
+        Ok(())
     }
 }
 
